@@ -1,0 +1,25 @@
+# Build config for the SLSA Go builder.
+# Format: https://github.com/slsa-framework/slsa-github-generator/blob/main/internal/builders/go/README.md#configuration-file
+
+version: 1
+
+env:
+  - GO111MODULE=on
+  # All direct DB drivers (modernc.org/sqlite, lib/pq, go-sql-driver/mysql)
+  # and crypto deps (x/crypto/ssh, pkg/sftp) are pure Go — CGO off keeps
+  # the binary fully static and avoids glibc pinning.
+  - CGO_ENABLED=0
+
+flags:
+  - -trimpath
+
+goos: linux
+goarch: amd64
+
+ldflags:
+  - "-s -w"
+  - "-X main.version={{ .Env.GITHUB_REF_NAME }}"
+  - "-X main.commit={{ .Env.GITHUB_SHA }}"
+
+main: ./cmd/gitea2forgejo
+binary: gitea2forgejo-linux-amd64

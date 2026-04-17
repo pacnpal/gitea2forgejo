@@ -17,6 +17,12 @@ import (
 	"github.com/pacnpal/gitea2forgejo/internal/restore"
 )
 
+// Injected at build time via -ldflags -X. See .slsa-goreleaser.yml.
+var (
+	version = "dev"
+	commit  = "none"
+)
+
 var (
 	configPath string
 	logLevel   string
@@ -25,8 +31,9 @@ var (
 
 func main() {
 	root := &cobra.Command{
-		Use:   "gitea2forgejo",
-		Short: "One-time, full-fidelity migration from Gitea ≥1.23 to Forgejo v15+",
+		Use:     "gitea2forgejo",
+		Short:   "One-time, full-fidelity migration from Gitea ≥1.23 to Forgejo v15+",
+		Version: fmt.Sprintf("%s (commit %s)", version, commit),
 		PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
 			lvl := slog.LevelInfo
 			switch logLevel {

@@ -1,0 +1,24 @@
+# SLSA3-compliant Go release workflow.
+# Produces signed provenance attestations verifiable via slsa-verifier.
+# See https://slsa.dev and https://github.com/slsa-framework/slsa-github-generator.
+
+name: SLSA Go releaser
+on:
+  workflow_dispatch:
+  release:
+    types: [created]
+
+permissions: read-all
+
+jobs:
+  build:
+    permissions:
+      id-token: write # To sign provenance.
+      contents: write # To upload release assets.
+      actions: read   # To read workflow path for provenance.
+    uses: slsa-framework/slsa-github-generator/.github/workflows/builder_go_slsa3.yml@v2.1.0
+    with:
+      go-version: "1.26"
+      config-file: .slsa-goreleaser.yml
+      # Upload the built binary + its provenance to the triggering release.
+      upload-assets: true
