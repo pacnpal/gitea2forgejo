@@ -18,8 +18,8 @@ goarch: amd64
 
 ldflags:
   - "-s -w"
-  - "-X main.version={{ .Env.GITHUB_REF_NAME }}"
-  - "-X main.commit={{ .Env.GITHUB_SHA }}"
+  - "-X main.version={{ .Env.VERSION }}"
+  - "-X main.commit={{ .Env.COMMIT }}"
 
 main: ./cmd/gitea2forgejo
 binary: gitea2forgejo-linux-amd64

@@ -22,3 +22,8 @@ jobs:
       config-file: .slsa-goreleaser.yml
       # Upload the built binary + its provenance to the triggering release.
       upload-assets: true
+      # GITHUB_SHA / GITHUB_REF_NAME aren't available to the builder's
+      # template evaluator by default — pass them explicitly as trusted,
+      # evaluated environment inputs so the config can reference them
+      # as {{ .Env.VERSION }} and {{ .Env.COMMIT }}.
+      evaluated-envs: "VERSION:${{ github.ref_name }}, COMMIT:${{ github.sha }}"
