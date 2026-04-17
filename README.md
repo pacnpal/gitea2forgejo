@@ -212,15 +212,24 @@ gitea2forgejo --version
 ### Step 2 — Install the OS-level helpers mig-host shells out to
 
 ```sh
-# Debian / Ubuntu
+# Debian 13+ / recent Ubuntu — mysql-client was dropped;
+# MariaDB's client is a drop-in (provides mysql / mysqldump).
+sudo apt install rsync postgresql-client default-mysql-client zstd openssh-client
+
+# Debian 12 / older Ubuntu
 sudo apt install rsync postgresql-client mysql-client zstd openssh-client
 
-# Fedora / RHEL
-sudo dnf install rsync postgresql mysql zstd openssh-clients
+# Fedora / RHEL — `mariadb` provides mysql + mysqldump.
+sudo dnf install rsync postgresql mariadb zstd openssh-clients
 
 # macOS (Homebrew)
 brew install rsync postgresql mysql-client zstd
 ```
+
+Skip the MySQL/MariaDB package if your source + target both use Postgres
+(or both SQLite). Skip `postgresql-client` / `postgresql` if neither uses
+Postgres. You only need the client tools for the DB engine(s) your
+instances actually run.
 
 Additionally:
 
