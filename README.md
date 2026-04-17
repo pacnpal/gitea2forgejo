@@ -16,11 +16,63 @@ Actions secrets CSV).
 Work in progress. See `docs/what-breaks.md` for the authoritative list of what
 this tool handles and what requires manual operator action.
 
-## Build
+## Install
+
+### Pre-built release binary (recommended)
+
+Each release attaches a static linux/amd64 binary built and signed by the
+[SLSA3 Go builder](https://github.com/slsa-framework/slsa-github-generator)
+along with an `.intoto.jsonl` provenance attestation.
 
 ```sh
+VERSION=v0.1.0
+curl -L -o gitea2forgejo \
+  https://github.com/pacnpal/gitea2forgejo/releases/download/$VERSION/gitea2forgejo-linux-amd64
+chmod +x gitea2forgejo
+sudo mv gitea2forgejo /usr/local/bin/
+gitea2forgejo --version
+```
+
+Verify the provenance before running (optional but recommended):
+
+```sh
+# Install once.
+go install github.com/slsa-framework/slsa-verifier/v2/cli/slsa-verifier@latest
+
+# Fetch binary + provenance, then verify.
+VERSION=v0.1.0
+curl -L -o gitea2forgejo-linux-amd64 \
+  https://github.com/pacnpal/gitea2forgejo/releases/download/$VERSION/gitea2forgejo-linux-amd64
+curl -L -o gitea2forgejo-linux-amd64.intoto.jsonl \
+  https://github.com/pacnpal/gitea2forgejo/releases/download/$VERSION/gitea2forgejo-linux-amd64.intoto.jsonl
+
+slsa-verifier verify-artifact \
+  --provenance-path gitea2forgejo-linux-amd64.intoto.jsonl \
+  --source-uri github.com/pacnpal/gitea2forgejo \
+  --source-tag $VERSION \
+  gitea2forgejo-linux-amd64
+```
+
+### `go install`
+
+```sh
+go install github.com/pacnpal/gitea2forgejo/cmd/gitea2forgejo@latest
+```
+
+The binary lands at `$(go env GOPATH)/bin/gitea2forgejo`. This route does
+NOT produce a SLSA provenance; use the release binary if you want supply-chain
+attestations.
+
+### Build from source
+
+```sh
+git clone https://github.com/pacnpal/gitea2forgejo
+cd gitea2forgejo
 go build -o gitea2forgejo ./cmd/gitea2forgejo
 ```
+
+Requires Go 1.26+. The binary is fully static (`CGO_ENABLED=0`) and works on
+any linux/amd64 host.
 
 ## Subcommands
 
@@ -48,13 +100,8 @@ $EDITOR config.yaml
 
 ## Requirements
 
-- Go 1.22+ (to build)
+- Go 1.26+ (only if building from source or using `go install`)
 - Source host: SSH access + admin token
 - Target host: SSH access + admin token + empty Forgejo v15 install
 - On the machine running the tool: `rsync`, `psql` or `mysql`, `mc` (MinIO
   client) if S3 storage is in use, `skopeo` if OCI packages are in use
-
-## Plan
-
-See `/home/pac/.claude/plans/heavily-research-and-plan-cheerful-popcorn.md` for
-the full design rationale and the research reports it was built from.
