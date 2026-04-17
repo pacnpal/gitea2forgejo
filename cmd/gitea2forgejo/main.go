@@ -8,11 +8,15 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
 
 	"github.com/spf13/cobra"
 
 	"github.com/pacnpal/gitea2forgejo/internal/config"
 	"github.com/pacnpal/gitea2forgejo/internal/dump"
+	"github.com/pacnpal/gitea2forgejo/internal/initcmd"
 	"github.com/pacnpal/gitea2forgejo/internal/preflight"
 	"github.com/pacnpal/gitea2forgejo/internal/restore"
 )
@@ -51,6 +55,7 @@ func main() {
 	root.PersistentFlags().StringVar(&configPath, "config", "config.yaml", "path to config YAML")
 	root.PersistentFlags().StringVar(&logLevel, "log-level", "info", "debug|info|warn|error")
 
+	root.AddCommand(newInitCmd())
 	root.AddCommand(newPreflightCmd())
 	root.AddCommand(newDumpCmd())
 	root.AddCommand(newRestoreCmd())
@@ -63,6 +68,110 @@ func main() {
 
 func loadConfig() (*config.Config, error) {
 	return config.Load(configPath)
+}
+
+func newInitCmd() *cobra.Command {
+	opt := &initcmd.Options{}
+	var (
+		sourceSSH string
+		targetSSH string
+	)
+	cmd := &cobra.Command{
+		Use:   "init",
+		Short: "Auto-discover source configuration and write a ready-to-run config.yaml",
+		Long: `Connects to the source Gitea host via SSH, reads its app.ini,
+extracts data paths + DB config + storage backend + Docker container (if any),
+and emits a config.yaml with as many fields pre-filled as possible. Secrets
+become env:<NAME> references; export them before running preflight.
+
+Typical invocation:
+
+  export SOURCE_ADMIN_TOKEN=gta_...
+  export TARGET_ADMIN_TOKEN=fjo_...
+
+  gitea2forgejo init \
+    --source-url   https://gitea.example.com \
+    --source-ssh   root@gitea.example.com \
+    --target-url   https://forgejo.example.com \
+    --target-ssh   root@forgejo.example.com \
+    --ssh-key      ~/.ssh/gitea2forgejo \
+    -o config.yaml
+
+Then review config.yaml, fill in any env vars the generator flagged, and
+run 'gitea2forgejo preflight --config config.yaml'.`,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			var err error
+			opt.SourceSSHUser, opt.SourceSSHHost, opt.SourceSSHPort, err = parseSSHDest(sourceSSH)
+			if err != nil {
+				return fmt.Errorf("--source-ssh: %w", err)
+			}
+			opt.TargetSSHUser, opt.TargetSSHHost, opt.TargetSSHPort, err = parseSSHDest(targetSSH)
+			if err != nil {
+				return fmt.Errorf("--target-ssh: %w", err)
+			}
+			return initcmd.Run(opt, log)
+		},
+	}
+	cmd.Flags().StringVar(&opt.SourceURL, "source-url", "", "source Gitea URL (required)")
+	cmd.Flags().StringVar(&opt.SourceToken, "source-token", "", "source admin token (defaults to env:SOURCE_ADMIN_TOKEN reference)")
+	cmd.Flags().StringVar(&sourceSSH, "source-ssh", "", "source SSH destination: [user@]host[:port] (required)")
+	cmd.Flags().StringVar(&opt.SourceSSHKey, "source-ssh-key", "", "source SSH key (defaults to --ssh-key)")
+	cmd.Flags().StringVar(&opt.SourceAppIni, "source-app-ini", "", "override app.ini path on source (default: auto-discover)")
+	cmd.Flags().StringVar(&opt.SourceContainer, "source-container", "", "override Docker container name (default: auto-detect)")
+
+	cmd.Flags().StringVar(&opt.TargetURL, "target-url", "", "target Forgejo URL (required)")
+	cmd.Flags().StringVar(&opt.TargetToken, "target-token", "", "target admin token")
+	cmd.Flags().StringVar(&targetSSH, "target-ssh", "", "target SSH destination: [user@]host[:port] (required)")
+	cmd.Flags().StringVar(&opt.TargetSSHKey, "target-ssh-key", "", "target SSH key (defaults to --ssh-key)")
+	cmd.Flags().StringVar(&opt.TargetAppIni, "target-app-ini", "", "override app.ini path on target")
+	cmd.Flags().StringVar(&opt.TargetContainer, "target-container", "", "override Docker container name on target")
+
+	var sharedKey string
+	cmd.Flags().StringVar(&sharedKey, "ssh-key", "", "SSH private key used for both hosts (default ~/.ssh/id_ed25519)")
+	cmd.Flags().StringVar(&opt.WorkDir, "work-dir", "/var/cache/gitea2forgejo", "local scratch directory for dump artifacts")
+	cmd.Flags().StringVarP(&opt.Output, "output", "o", "config.yaml", "path to write the generated config")
+	cmd.Flags().BoolVar(&opt.InsecureTLS, "insecure-tls", false, "skip TLS verification for source/target APIs")
+
+	cmd.PreRunE = func(cmd *cobra.Command, args []string) error {
+		if sharedKey == "" {
+			home, _ := os.UserHomeDir()
+			sharedKey = filepath.Join(home, ".ssh", "id_ed25519")
+		}
+		if opt.SourceSSHKey == "" {
+			opt.SourceSSHKey = sharedKey
+		}
+		if opt.TargetSSHKey == "" {
+			opt.TargetSSHKey = sharedKey
+		}
+		return nil
+	}
+	return cmd
+}
+
+// parseSSHDest accepts [user@]host[:port] and extracts the components.
+func parseSSHDest(dest string) (user, host string, port int, err error) {
+	if dest == "" {
+		err = fmt.Errorf("empty destination")
+		return
+	}
+	port = 22
+	if i := strings.Index(dest, "@"); i > 0 {
+		user = dest[:i]
+		dest = dest[i+1:]
+	}
+	host = dest
+	if i := strings.LastIndex(dest, ":"); i > 0 {
+		p := dest[i+1:]
+		var n int
+		n, err = strconv.Atoi(p)
+		if err != nil {
+			err = fmt.Errorf("bad port %q", p)
+			return
+		}
+		host = dest[:i]
+		port = n
+	}
+	return
 }
 
 func newPreflightCmd() *cobra.Command {

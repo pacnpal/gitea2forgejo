@@ -200,6 +200,7 @@ version bumps in the release notes.
 
 | Command      | Status      | Purpose                                                        |
 |--------------|-------------|----------------------------------------------------------------|
+| `init`       | ✅ shipped  | SSH to source, read app.ini, auto-populate `config.yaml`.      |
 | `preflight`  | ✅ shipped  | Read-only checks: versions, SSH, DB, disk, `SECRET_KEY`.       |
 | `dump`       | ✅ shipped  | `gitea dump` + native DB dump + S3 mirror + source manifest.   |
 | `restore`    | ✅ shipped  | File copy, DB import, schema trick, `forgejo doctor`.          |
@@ -297,6 +298,41 @@ Additionally:
 - [skopeo](https://github.com/containers/skopeo) if your source has OCI
   container packages in its registry
 
+### Speed run: `gitea2forgejo init`
+
+If you want `gitea2forgejo` to figure out as much of `config.yaml` as it
+can on its own:
+
+```sh
+export SOURCE_ADMIN_TOKEN=gta_...
+export TARGET_ADMIN_TOKEN=fjo_...
+
+gitea2forgejo init \
+  --source-url   https://gitea.example.com \
+  --source-ssh   root@gitea.example.com \
+  --target-url   https://forgejo.example.com \
+  --target-ssh   root@forgejo.example.com \
+  --ssh-key      ~/.ssh/gitea2forgejo \
+  -o config.yaml
+```
+
+`init` does:
+
+1. Opens an SSH connection to the source host.
+2. Runs `docker ps` to detect whether Gitea is in a container (and if so,
+   `docker inspect` to resolve the bind-mounted `app.ini` path).
+3. Reads the source `app.ini` and extracts: `data_dir`, `repo_root`,
+   DB type + host + port + name + user, S3 storage config.
+4. Does the same for the target (best-effort — fresh Forgejo installs
+   often won't have an app.ini yet, in which case it falls back to
+   standard defaults).
+5. Writes `config.yaml` with secrets as `env:<NAME>` references so you
+   never commit them to disk.
+
+After it runs, export the env vars it refers to and run
+`gitea2forgejo preflight --config config.yaml`. That's usually all the
+setup you need.
+
 ### Running Gitea or Forgejo in Docker
 
 If either side runs in Docker (or Podman), add a `docker:` block to that
@@ -365,6 +401,77 @@ source:
 ```
 
 Similarly for the target Forgejo's `docker:` block.
+
+#### Ready-to-use target Compose stack
+
+Instead of hand-rolling the target Forgejo + Postgres setup, copy the
+templates in [`templates/`](templates/):
+
+```sh
+curl -L -o docker-compose.yml \
+  https://raw.githubusercontent.com/pacnpal/gitea2forgejo/main/templates/docker-compose.target.yml
+curl -L -o .env \
+  https://raw.githubusercontent.com/pacnpal/gitea2forgejo/main/templates/docker-compose.env.example
+$EDITOR .env                            # set FORGEJO_DOMAIN + DB credentials
+
+docker compose up -d db                 # wait for DB to be healthy
+docker compose up -d forgejo            # starts, creates schema — DO NOT visit the web UI
+docker compose stop forgejo             # leave stopped until restore completes
+```
+
+The compose file uses **identical host and container paths**
+(`/srv/forgejo/data` → `/srv/forgejo/data`) so `remote_work_dir` works
+with no path translation; match it in `config.yaml`:
+
+```yaml
+target:
+  data_dir: /srv/forgejo/data
+  repo_root: /srv/forgejo/repositories
+  custom_dir: /srv/forgejo/custom
+  remote_work_dir: /srv/forgejo/data/migration
+  docker:
+    container: forgejo
+    user: git
+```
+
+#### Unraid
+
+Unraid Community Applications installs Gitea (and Forgejo) as managed
+Docker containers. For gitea2forgejo:
+
+- **SSH target**: `root@<unraid-host>` on port 22. Unraid's root shell is
+  enabled by default.
+- **Paths on the Unraid host** (standard CA template):
+  - `/mnt/user/appdata/gitea/gitea/conf/app.ini` — the app.ini
+  - `/mnt/user/appdata/gitea/` — data/repos/custom all live under here
+- **Container name**: usually `Gitea` (capital G — Unraid's CA templates
+  preserve the casing). Check with `docker ps --format '{{.Names}}'` via
+  Unraid's terminal.
+- **`docker:` block in `config.yaml`**:
+  ```yaml
+  source:
+    ssh: { host: tower.local, user: root, key: ~/.ssh/gitea2forgejo }
+    config_file: /mnt/user/appdata/gitea/gitea/conf/app.ini
+    data_dir:   /mnt/user/appdata/gitea
+    repo_root:  /mnt/user/appdata/gitea/git/repositories
+    custom_dir: /mnt/user/appdata/gitea/gitea
+    remote_work_dir: /mnt/user/appdata/gitea/migration
+    docker:
+      container: Gitea
+      user: git
+      binary: docker
+  ```
+- `gitea2forgejo init --source-ssh root@tower.local ...` handles all
+  of the above automatically on most Unraid installs; verify the detected
+  paths before running preflight.
+
+Unraid caveats:
+
+- Don't run migration during an Unraid "Parity Check" — disk I/O will
+  be miserable.
+- The gitea user inside the CA-templated container is usually `git`
+  (uid 1000). If you customized PUID/PGID in the Gitea template, update
+  the `docker.user` in your config accordingly.
 
 ### Step 3 — Provision the target host and install Forgejo v15
 

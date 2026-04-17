@@ -1,0 +1,99 @@
+# Target Forgejo v15 + Postgres, pre-wired for `gitea2forgejo restore`.
+#
+# HOW TO USE
+#   1. Edit the `.env` file next to this compose (see docker-compose.env.example).
+#   2. `docker compose -f docker-compose.target.yml up -d db`
+#      — wait for db to be healthy, then:
+#      `docker compose -f docker-compose.target.yml up -d forgejo`
+#   3. **DO NOT open the Forgejo web UI** and do not run the setup wizard.
+#      The DB must remain empty for `gitea2forgejo restore` to import into.
+#   4. `docker compose -f docker-compose.target.yml stop forgejo`
+#      — leave stopped until restore completes.
+#   5. From the migration host:
+#      gitea2forgejo init --target-ssh root@<docker-host> \
+#                         --target-container forgejo --target-url https://...
+#
+# DESIGN NOTES
+#   * Bind mounts use IDENTICAL host/container paths so the gitea2forgejo
+#     tool's `remote_work_dir` constraint is satisfied without
+#     in-config-file path translation. The volumes live under
+#     /srv/forgejo on the host AND inside the container.
+#   * Postgres uses a named volume because the migration tool doesn't
+#     access the Postgres data directory directly; it hits port 5432.
+#   * No published ports on Forgejo — terminate TLS in a reverse proxy
+#     (Caddy/nginx/Traefik) reaching `forgejo:3000` on the compose network.
+
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER:     ${FORGEJO_DB_USER}
+      POSTGRES_PASSWORD: ${FORGEJO_DB_PASSWORD}
+      POSTGRES_DB:       ${FORGEJO_DB_NAME}
+    volumes:
+      - db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    # Expose only inside the compose network. Uncomment the ports block
+    # ONLY if the gitea2forgejo tool runs on a different host and needs
+    # direct DB access for pg_restore:
+    # ports:
+    #   - "127.0.0.1:5433:5432"
+
+  forgejo:
+    image: codeberg.org/forgejo/forgejo:15
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      USER_UID:          1000
+      USER_GID:          1000
+      FORGEJO__database__DB_TYPE: postgres
+      FORGEJO__database__HOST:    db:5432
+      FORGEJO__database__NAME:    ${FORGEJO_DB_NAME}
+      FORGEJO__database__USER:    ${FORGEJO_DB_USER}
+      FORGEJO__database__PASSWD:  ${FORGEJO_DB_PASSWORD}
+      FORGEJO__server__DOMAIN:    ${FORGEJO_DOMAIN}
+      FORGEJO__server__ROOT_URL:  https://${FORGEJO_DOMAIN}/
+    volumes:
+      # Identical host/container paths — the critical constraint for
+      # `gitea2forgejo` when source.docker is used. The migration tool
+      # writes `gitea dump --file /srv/forgejo/data/migration/…` inside
+      # the container; the file appears on the host at the same path.
+      - /srv/forgejo/data:/srv/forgejo/data
+      - /srv/forgejo/custom:/srv/forgejo/custom
+      - /srv/forgejo/repositories:/srv/forgejo/repositories
+    expose:
+      - "3000"
+      - "22"
+    # networks: [default]
+
+volumes:
+  db_data:
+
+# ---
+# gitea2forgejo config.yaml snippet matching this compose:
+#
+# target:
+#   url: https://forgejo.example.com
+#   ssh:
+#     host: docker-host.example.com       # the Docker HOST
+#     user: root
+#     key: ~/.ssh/gitea2forgejo
+#   config_file: /srv/forgejo/data/gitea/conf/app.ini
+#   data_dir:    /srv/forgejo/data
+#   repo_root:   /srv/forgejo/repositories
+#   custom_dir:  /srv/forgejo/custom
+#   remote_work_dir: /srv/forgejo/data/migration
+#   db:
+#     dialect: postgres
+#     dsn: env:TARGET_DB_DSN
+#   docker:
+#     container: forgejo
+#     user: git
+#     binary: docker
