@@ -10,56 +10,61 @@ import (
 	"golang.org/x/term"
 )
 
-// Interactive fills in any empty fields on opt by prompting at the TTY.
-// If stdin isn't a TTY, it returns without prompting (so CI / scripted
-// users still get the non-interactive "missing flag" error from validate()).
+// Interactive prompts only for fields that are missing. If every required
+// field is already set (via flags or environment variables) it returns
+// silently — running `gitea2forgejo init --source-url ... --target-ssh ...`
+// with the relevant env vars exported should NOT drop into an interactive
+// prompt.
 //
-// Each prompt shows the current default (if any) in brackets; pressing
-// Enter accepts the default. Secret fields (tokens) don't echo.
+// On non-TTY stdin it returns without prompting (CI / scripted users still
+// get the non-interactive "missing flag" error from validate()).
 func Interactive(opt *Options) error {
 	in := os.Stdin
 	if !term.IsTerminal(int(in.Fd())) {
 		return nil
 	}
+
+	// Decide what's actually missing BEFORE printing any banner.
+	needSourceURL := opt.SourceURL == ""
+	needSourceSSH := opt.SourceSSHHost == ""
+	needSourceTok := opt.SourceToken == "" && os.Getenv("SOURCE_ADMIN_TOKEN") == ""
+	needTargetURL := opt.TargetURL == ""
+	needTargetSSH := opt.TargetSSHHost == ""
+	needTargetTok := opt.TargetToken == "" && os.Getenv("TARGET_ADMIN_TOKEN") == ""
+
+	if !needSourceURL && !needSourceSSH && !needSourceTok &&
+		!needTargetURL && !needTargetSSH && !needTargetTok {
+		return nil
+	}
+
 	w := os.Stderr
 	r := bufio.NewReader(in)
-
-	fmt.Fprintln(w, "gitea2forgejo init — interactive setup")
-	fmt.Fprintln(w, "Press Enter to accept the default shown in [brackets].")
+	fmt.Fprintln(w, "gitea2forgejo init — answer the prompts below to fill in missing values.")
 	fmt.Fprintln(w)
 
-	fmt.Fprintln(w, "# Source (your existing Gitea)")
-	opt.SourceURL = promptLine(r, w, "Source Gitea URL", opt.SourceURL)
-	sourceSSH := sshDestFromOpt(opt.SourceSSHUser, opt.SourceSSHHost, opt.SourceSSHPort)
-	sourceSSH = promptLine(r, w, "Source SSH destination (user@host[:port])", sourceSSH)
-	parseIntoSource(opt, sourceSSH)
-	if opt.SourceToken == "" || strings.HasPrefix(opt.SourceToken, "env:") {
-		t := promptSecret(in, w, "Source admin token (leave blank to use $SOURCE_ADMIN_TOKEN)")
-		if t != "" {
+	if needSourceURL {
+		opt.SourceURL = promptLine(r, w, "Source Gitea URL", "")
+	}
+	if needSourceSSH {
+		dest := promptLine(r, w, "Source SSH destination (user@host[:port])", "")
+		parseIntoSource(opt, dest)
+	}
+	if needSourceTok {
+		if t := promptSecret(in, w, "Source admin token"); t != "" {
 			opt.SourceToken = t
 		}
 	}
-
-	fmt.Fprintln(w)
-	fmt.Fprintln(w, "# Target (your new Forgejo)")
-	opt.TargetURL = promptLine(r, w, "Target Forgejo URL", opt.TargetURL)
-	targetSSH := sshDestFromOpt(opt.TargetSSHUser, opt.TargetSSHHost, opt.TargetSSHPort)
-	targetSSH = promptLine(r, w, "Target SSH destination (user@host[:port])", targetSSH)
-	parseIntoTarget(opt, targetSSH)
-	if opt.TargetToken == "" || strings.HasPrefix(opt.TargetToken, "env:") {
-		t := promptSecret(in, w, "Target admin token (leave blank to use $TARGET_ADMIN_TOKEN)")
-		if t != "" {
+	if needTargetURL {
+		opt.TargetURL = promptLine(r, w, "Target Forgejo URL", "")
+	}
+	if needTargetSSH {
+		dest := promptLine(r, w, "Target SSH destination (user@host[:port])", "")
+		parseIntoTarget(opt, dest)
+	}
+	if needTargetTok {
+		if t := promptSecret(in, w, "Target admin token"); t != "" {
 			opt.TargetToken = t
 		}
-	}
-
-	fmt.Fprintln(w)
-	fmt.Fprintln(w, "# Local options")
-	opt.WorkDir = promptLine(r, w, "Local work dir", opt.WorkDir)
-	opt.Output = promptLine(r, w, "Output config path", opt.Output)
-
-	if promptYN(r, w, "Skip TLS verification (only if either side uses self-signed certs)", opt.InsecureTLS) {
-		opt.InsecureTLS = true
 	}
 	fmt.Fprintln(w)
 	return nil
