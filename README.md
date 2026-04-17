@@ -20,16 +20,22 @@ this tool handles and what requires manual operator action.
 
 ### Pre-built release binary (recommended)
 
-Each release attaches static binaries for 6 platforms — `linux`, `darwin`,
-and `windows` on both `amd64` and `arm64` — built and signed by the
-[SLSA3 Go builder](https://github.com/slsa-framework/slsa-github-generator)
-along with one `.intoto.jsonl` provenance attestation per binary.
+Each release attaches static binaries for 6 platforms, built and signed by
+the [SLSA3 Go builder](https://github.com/slsa-framework/slsa-github-generator)
+with one `.intoto.jsonl` provenance attestation per binary.
+
+| Platform (Go)          | OS                         | CPU             | File                                   |
+|------------------------|----------------------------|-----------------|----------------------------------------|
+| `linux/amd64`          | Linux                      | x86-64 / Intel  | `gitea2forgejo-linux-amd64`            |
+| `linux/arm64`          | Linux                      | ARM64 / aarch64 | `gitea2forgejo-linux-arm64`            |
+| `darwin/amd64`         | macOS (Intel Macs)         | x86-64          | `gitea2forgejo-darwin-amd64`           |
+| `darwin/arm64`         | macOS (Apple Silicon)      | ARM64 (M1/M2/M3/M4) | `gitea2forgejo-darwin-arm64`       |
+| `windows/amd64`        | Windows                    | x86-64          | `gitea2forgejo-windows-amd64.exe`      |
+| `windows/arm64`        | Windows                    | ARM64           | `gitea2forgejo-windows-arm64.exe`      |
 
 ```sh
 VERSION=v0.1.0
-# Pick one. Windows binaries have a .exe suffix.
-PLATFORM=linux-amd64        # linux-amd64 | linux-arm64 | darwin-amd64 |
-                            # darwin-arm64 | windows-amd64.exe | windows-arm64.exe
+PLATFORM=linux-amd64        # see table above
 
 curl -L -o gitea2forgejo \
   https://github.com/pacnpal/gitea2forgejo/releases/download/$VERSION/gitea2forgejo-$PLATFORM
@@ -38,18 +44,58 @@ sudo mv gitea2forgejo /usr/local/bin/
 gitea2forgejo --version
 ```
 
-**Platform notes:**
+#### macOS: running the unsigned binary
 
-- **Linux**: primary target. All external commands (`rsync`, `pg_dump`, `tar`,
-  `mc`, `skopeo`) are in distro package repos.
-- **macOS**: works fully; install `rsync`, `postgresql` (for `pg_dump`),
-  `zstd`, `mc` and `skopeo` via Homebrew.
-- **Windows**: native binaries build and the API-only flows (`preflight`,
-  manifest harvest, API supplement) work, but the dump/restore stages shell
-  out to rsync/pg_dump/tar-with-zstd. Use from WSL2 or Git Bash with MSYS2
+The release binaries are **not** Apple Developer-ID signed or notarized —
+Gatekeeper will refuse to run them by default. Two mitigation options:
+
+**Option A: strip the quarantine attribute (simplest).**
+
+```sh
+curl -L -o gitea2forgejo \
+  https://github.com/pacnpal/gitea2forgejo/releases/download/v0.1.0/gitea2forgejo-darwin-arm64
+xattr -dr com.apple.quarantine gitea2forgejo      # remove Gatekeeper flag
+chmod +x gitea2forgejo
+./gitea2forgejo --version
+```
+
+**Option B: ad-hoc self-sign (survives `xattr` resets and works across
+subsequent runs without Gatekeeper prompting).**
+
+```sh
+codesign --force --sign - gitea2forgejo
+```
+
+**macOS 26 ("Tahoe") extra step.** Tahoe hardened Gatekeeper: double-clicking
+an unsigned binary no longer offers the old "right-click → Open" override
+from a Finder contextual menu. Workflow:
+
+1. Try to run once from Terminal — it will fail with a Gatekeeper message.
+2. Open **System Settings → Privacy & Security**, scroll to the
+   *"'gitea2forgejo' was blocked to protect your Mac"* banner, and click
+   **"Open Anyway"** (Touch ID / admin password required).
+3. Run the binary again from Terminal; you'll be prompted once more to
+   confirm, then it executes normally thereafter.
+
+If `xattr -dr com.apple.quarantine` + `codesign --force --sign -` are both
+applied **before** first launch, Tahoe skips the Settings step entirely
+because there's no quarantine flag for Gatekeeper to act on.
+
+**Avoid `sudo spctl --master-disable`** — that disables Gatekeeper
+system-wide and is stronger than you want.
+
+#### Platform-specific dependencies
+
+- **Linux**: primary target. All external commands (`rsync`, `pg_dump`,
+  `tar`, `mc`, `skopeo`) are in distro package repos.
+- **macOS**: install `rsync`, `postgresql` (for `pg_dump`), `zstd`, `mc` and
+  `skopeo` via Homebrew.
+- **Windows**: native binaries run and the API-only flows (`preflight`,
+  manifest harvest, API supplement) work, but dump/restore shell out to
+  `rsync` / `pg_dump` / tar-with-zstd. Use from WSL2 or Git Bash with MSYS2
   packages installed; native PowerShell is not supported.
 
-Verify the provenance before running (optional but recommended):
+#### Verify the SLSA provenance (recommended)
 
 ```sh
 # Install once.
