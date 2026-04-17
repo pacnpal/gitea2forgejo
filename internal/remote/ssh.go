@@ -214,10 +214,18 @@ func (c *Client) ReadFile(path string) ([]byte, error) {
 
 // FetchFile downloads remotePath to localPath.
 //
-// For multi-GB dumps the copy takes minutes and gives no signal of life.
-// We stat the remote file up front to know the expected size, then emit
-// progress lines every 5 seconds so the operator can see throughput.
+// Fast path: if remotePath is also accessible via the local filesystem
+// (tool running on the same box as source, Unraid/homelab case), skip
+// SFTP entirely and use a hard link (instant, same filesystem) or a
+// local byte-copy (seconds, across filesystems). Avoids the SFTP
+// encryption + chunking overhead for a loop-to-self transfer.
+//
+// Slow path: real SSH-over-the-wire fetch with 5-second progress lines
+// for long-running transfers.
 func (c *Client) FetchFile(remotePath, localPath string) error {
+	if fi, err := os.Stat(remotePath); err == nil && !fi.IsDir() {
+		return localFetch(remotePath, localPath, fi)
+	}
 	src, err := c.sftp.Open(remotePath)
 	if err != nil {
 		return fmt.Errorf("open remote %s: %w", remotePath, err)
@@ -236,6 +244,36 @@ func (c *Client) FetchFile(remotePath, localPath string) error {
 	defer pr.done()
 	if _, err := io.Copy(io.MultiWriter(dst, pr), src); err != nil {
 		return fmt.Errorf("copy: %w", err)
+	}
+	return nil
+}
+
+// localFetch is the fast path when the "remote" file is visible on the
+// local filesystem. Tries os.Link first (same filesystem = O(1)) and
+// falls back to a local byte copy (ENOEXDEV = cross-filesystem).
+func localFetch(src, dst string, fi os.FileInfo) error {
+	_ = os.Remove(dst) // Link fails if dst exists.
+	if err := os.Link(src, dst); err == nil {
+		fmt.Fprintf(os.Stderr, "  fetch %s: hard-linked (%d MB)\n", src, fi.Size()/(1<<20))
+		return nil
+	}
+	// Hard link failed — probably cross-filesystem. Fall back to a
+	// streaming byte copy (still faster than SFTP because no
+	// encryption/chunking overhead).
+	in, err := os.Open(src)
+	if err != nil {
+		return fmt.Errorf("open local %s: %w", src, err)
+	}
+	defer in.Close()
+	out, err := os.Create(dst)
+	if err != nil {
+		return fmt.Errorf("create local %s: %w", dst, err)
+	}
+	defer out.Close()
+	pr := newProgressReporter(src, fi.Size())
+	defer pr.done()
+	if _, err := io.Copy(io.MultiWriter(out, pr), in); err != nil {
+		return fmt.Errorf("local copy: %w", err)
 	}
 	return nil
 }
