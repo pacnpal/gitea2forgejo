@@ -52,6 +52,17 @@ func Run(opt *Options, log *slog.Logger) error {
 	if err := opt.validate(); err != nil {
 		return err
 	}
+
+	// Ensure SSH is usable before attempting any probes. On failure in an
+	// interactive session, this offers to generate a key and ssh-copy-id
+	// it to the remote. On non-TTY, it returns the original error.
+	if err := ensureSSHOrBootstrap("source", opt, log); err != nil {
+		return fmt.Errorf("source ssh: %w", err)
+	}
+	if err := ensureSSHOrBootstrap("target", opt, log); err != nil {
+		return fmt.Errorf("target ssh: %w", err)
+	}
+
 	log.Info("init: probing source", "url", opt.SourceURL, "ssh", opt.SourceSSHHost)
 	srcSummary, srcContainer, err := probe(
 		opt.SourceURL, opt.InsecureTLS,
@@ -73,6 +84,32 @@ func Run(opt *Options, log *slog.Logger) error {
 
 	cfg := buildConfig(opt, srcSummary, srcContainer, tgtSummary, tgtContainer)
 	return writeYAML(cfg, opt.Output, log)
+}
+
+// ensureSSHOrBootstrap ensures SSH works for either the source or target. On
+// failure in a TTY it drives the ssh-keygen / ssh-keyscan / ssh-copy-id
+// flow in EnsureAuth. Side-effect: updates opt.<Label>SSHKey if a new key
+// was generated.
+func ensureSSHOrBootstrap(label string, opt *Options, log *slog.Logger) error {
+	var sshCfg *config.SSH
+	if label == "source" {
+		sshCfg = ProposeSSHConfig(opt.SourceSSHHost, opt.SourceSSHPort, opt.SourceSSHUser, opt.SourceSSHKey)
+	} else {
+		sshCfg = ProposeSSHConfig(opt.TargetSSHHost, opt.TargetSSHPort, opt.TargetSSHUser, opt.TargetSSHKey)
+	}
+	if sshCfg == nil {
+		return fmt.Errorf("no SSH host configured")
+	}
+	if err := EnsureAuth(label, sshCfg, log); err != nil {
+		return err
+	}
+	// Persist any key change back into opt.
+	if label == "source" {
+		opt.SourceSSHKey = sshCfg.Key
+	} else {
+		opt.TargetSSHKey = sshCfg.Key
+	}
+	return nil
 }
 
 func (opt *Options) validate() error {

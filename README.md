@@ -338,11 +338,22 @@ for CI / scripted runs.
 
 `init` does:
 
-1. Opens an SSH connection to the source host. Without `--ssh-key`, it
-   tries `~/.ssh/id_ed25519`, `id_ecdsa`, `id_rsa`, then falls back to
-   an `ssh-agent` (via `$SSH_AUTH_SOCK`) if available.
-2. Runs `docker ps` to detect whether Gitea is in a container (and if so,
-   `docker inspect` to resolve the bind-mounted `app.ini` path).
+1. **SSH bootstrap.** Tries to connect to the source host. Without
+   `--ssh-key`, it looks for `~/.ssh/id_ed25519`, `id_ecdsa`, `id_rsa`,
+   then falls back to `$SSH_AUTH_SOCK` (ssh-agent). **If nothing works
+   and you're at a TTY**, it offers to fix the problem for you:
+   ```
+   SSH to source 192.168.86.3 failed:
+     ssh dial: ...
+   Generate a new key and install it on 192.168.86.3? [Y/n]:
+   ```
+   On yes, it runs `ssh-keygen -t ed25519 -f ~/.ssh/gitea2forgejo`, then
+   `ssh-keyscan` to prime `~/.ssh/known_hosts`, then `ssh-copy-id`
+   (which prompts once for the remote password), then retries. Repeats
+   for the target host.
+2. Runs `docker ps` on the remote to detect whether Gitea is in a
+   container (and if so, `docker inspect` to resolve the bind-mounted
+   `app.ini` path).
 3. Reads the source `app.ini` and extracts: `data_dir`, `repo_root`,
    DB type + host + port + name + user, S3 storage config.
 4. Does the same for the target (best-effort — fresh Forgejo installs
@@ -354,6 +365,10 @@ for CI / scripted runs.
 After it runs, export the env vars it refers to and run
 `gitea2forgejo preflight --config config.yaml`. That's usually all the
 setup you need.
+
+Requirements: `ssh-keygen`, `ssh-keyscan`, and `ssh-copy-id` must be on
+`$PATH` for the bootstrap to work (they ship with `openssh-client` on
+all major distros and come preinstalled on macOS).
 
 ### Running Gitea or Forgejo in Docker
 
