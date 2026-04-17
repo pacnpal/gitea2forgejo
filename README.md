@@ -1,5 +1,36 @@
 # gitea2forgejo
 
+[![Latest release][release-badge]][release-url]
+[![Release date][release-date-badge]][release-url]
+[![Build status][build-badge]][build-url]
+[![SLSA 3][slsa-badge]][slsa-url]
+[![Downloads][downloads-badge]][downloads-url]
+[![License][license-badge]][license-url]
+
+[![Go version][go-version-badge]][go-version-url]
+[![Go reference][go-ref-badge]][go-ref-url]
+[![Go report card][goreport-badge]][goreport-url]
+[![Code size][codesize-badge]][codesize-url]
+[![Top language][lang-badge]][lang-url]
+[![Repo size][reposize-badge]][reposize-url]
+
+[![Open issues][issues-badge]][issues-url]
+[![Open PRs][prs-badge]][prs-url]
+[![Stars][stars-badge]][stars-url]
+[![Forks][forks-badge]][forks-url]
+[![Contributors][contrib-badge]][contrib-url]
+[![Last commit][lastcommit-badge]][lastcommit-url]
+[![Commit activity][activity-badge]][activity-url]
+
+[![Linux][linux-badge]](#install) [![macOS][macos-badge]](#install) [![Windows][windows-badge]](#install) [![amd64][amd64-badge]](#install) [![arm64][arm64-badge]](#install)
+
+[![Source: Gitea ≥1.23][source-badge]](#complete-walkthrough-gitea--forgejo-from-zero)
+[![Target: Forgejo v15+][target-badge]](#complete-walkthrough-gitea--forgejo-from-zero)
+[![Docker supported][docker-badge]](#running-gitea-or-forgejo-in-docker)
+[![Unraid tested][unraid-badge]](#unraid)
+[![Made with Go][made-badge]][go-ref-url]
+[![Maintained][maintained-badge]][lastcommit-url]
+
 One-time, full-fidelity migration from **Gitea ≥ 1.23** to **Forgejo v15+**.
 
 Forgejo's official drop-in path was severed at Gitea 1.22 (see
@@ -147,6 +178,60 @@ go build -o gitea2forgejo ./cmd/gitea2forgejo
 
 Requires Go 1.26+. The binary is fully static (`CGO_ENABLED=0`) and works on
 any linux/amd64 host.
+
+<!-- ------------------------ badge reference block --------------------- -->
+[release-badge]: https://img.shields.io/github/v/release/pacnpal/gitea2forgejo?display_name=tag&sort=semver&style=flat-square&logo=github
+[release-url]: https://github.com/pacnpal/gitea2forgejo/releases/latest
+[release-date-badge]: https://img.shields.io/github/release-date/pacnpal/gitea2forgejo?style=flat-square
+[build-badge]: https://img.shields.io/github/actions/workflow/status/pacnpal/gitea2forgejo/slsa-go-releaser.yml?branch=main&style=flat-square&logo=githubactions&label=SLSA%20build
+[build-url]: https://github.com/pacnpal/gitea2forgejo/actions/workflows/slsa-go-releaser.yml
+[slsa-badge]: https://img.shields.io/badge/SLSA-level%203-9cf?style=flat-square
+[slsa-url]: https://slsa.dev
+[downloads-badge]: https://img.shields.io/github/downloads/pacnpal/gitea2forgejo/total?style=flat-square&logo=github
+[downloads-url]: https://github.com/pacnpal/gitea2forgejo/releases
+[license-badge]: https://img.shields.io/github/license/pacnpal/gitea2forgejo?style=flat-square
+[license-url]: https://github.com/pacnpal/gitea2forgejo/blob/main/LICENSE
+
+[go-version-badge]: https://img.shields.io/github/go-mod/go-version/pacnpal/gitea2forgejo?style=flat-square&logo=go
+[go-version-url]: https://go.dev
+[go-ref-badge]: https://pkg.go.dev/badge/github.com/pacnpal/gitea2forgejo.svg
+[go-ref-url]: https://pkg.go.dev/github.com/pacnpal/gitea2forgejo
+[goreport-badge]: https://goreportcard.com/badge/github.com/pacnpal/gitea2forgejo?style=flat-square
+[goreport-url]: https://goreportcard.com/report/github.com/pacnpal/gitea2forgejo
+[codesize-badge]: https://img.shields.io/github/languages/code-size/pacnpal/gitea2forgejo?style=flat-square
+[codesize-url]: https://github.com/pacnpal/gitea2forgejo
+[lang-badge]: https://img.shields.io/github/languages/top/pacnpal/gitea2forgejo?style=flat-square&logo=go
+[lang-url]: https://github.com/pacnpal/gitea2forgejo
+[reposize-badge]: https://img.shields.io/github/repo-size/pacnpal/gitea2forgejo?style=flat-square
+[reposize-url]: https://github.com/pacnpal/gitea2forgejo
+
+[issues-badge]: https://img.shields.io/github/issues/pacnpal/gitea2forgejo?style=flat-square
+[issues-url]: https://github.com/pacnpal/gitea2forgejo/issues
+[prs-badge]: https://img.shields.io/github/issues-pr/pacnpal/gitea2forgejo?style=flat-square
+[prs-url]: https://github.com/pacnpal/gitea2forgejo/pulls
+[stars-badge]: https://img.shields.io/github/stars/pacnpal/gitea2forgejo?style=flat-square&logo=github
+[stars-url]: https://github.com/pacnpal/gitea2forgejo/stargazers
+[forks-badge]: https://img.shields.io/github/forks/pacnpal/gitea2forgejo?style=flat-square&logo=github
+[forks-url]: https://github.com/pacnpal/gitea2forgejo/network/members
+[contrib-badge]: https://img.shields.io/github/contributors/pacnpal/gitea2forgejo?style=flat-square
+[contrib-url]: https://github.com/pacnpal/gitea2forgejo/graphs/contributors
+[lastcommit-badge]: https://img.shields.io/github/last-commit/pacnpal/gitea2forgejo?style=flat-square
+[lastcommit-url]: https://github.com/pacnpal/gitea2forgejo/commits/main
+[activity-badge]: https://img.shields.io/github/commit-activity/m/pacnpal/gitea2forgejo?style=flat-square
+[activity-url]: https://github.com/pacnpal/gitea2forgejo/commits/main
+
+[linux-badge]: https://img.shields.io/badge/linux-supported-blue?style=flat-square&logo=linux&logoColor=white
+[macos-badge]: https://img.shields.io/badge/macOS-supported-blue?style=flat-square&logo=apple&logoColor=white
+[windows-badge]: https://img.shields.io/badge/windows-supported-blue?style=flat-square&logo=windows&logoColor=white
+[amd64-badge]: https://img.shields.io/badge/amd64-supported-blue?style=flat-square
+[arm64-badge]: https://img.shields.io/badge/arm64-supported-blue?style=flat-square
+
+[source-badge]: https://img.shields.io/badge/source-Gitea%20%E2%89%A51.23-609926?style=flat-square&logo=gitea&logoColor=white
+[target-badge]: https://img.shields.io/badge/target-Forgejo%20v15%2B-ff671f?style=flat-square
+[docker-badge]: https://img.shields.io/badge/Docker-supported-2496ED?style=flat-square&logo=docker&logoColor=white
+[unraid-badge]: https://img.shields.io/badge/Unraid-tested-f15a2c?style=flat-square
+[made-badge]: https://img.shields.io/badge/made%20with-Go-00ADD8?style=flat-square&logo=go&logoColor=white
+[maintained-badge]: https://img.shields.io/maintenance/yes/2026?style=flat-square
 
 ## Updating
 
