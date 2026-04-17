@@ -34,15 +34,19 @@ with one `.intoto.jsonl` provenance attestation per binary.
 | `windows/arm64`        | Windows                    | ARM64           | `gitea2forgejo-windows-arm64.exe`      |
 
 ```sh
-VERSION=v0.1.0
 PLATFORM=linux-amd64        # see table above
 
 curl -L -o gitea2forgejo \
-  https://github.com/pacnpal/gitea2forgejo/releases/download/$VERSION/gitea2forgejo-$PLATFORM
+  https://github.com/pacnpal/gitea2forgejo/releases/latest/download/gitea2forgejo-$PLATFORM
 chmod +x gitea2forgejo
 sudo mv gitea2forgejo /usr/local/bin/
 gitea2forgejo --version
 ```
+
+GitHub's `/releases/latest/download/` URLs always redirect to the newest
+non-prerelease asset, so this command keeps working across future releases
+without edits. To pin to a specific version, swap `/latest/download/` for
+`/download/v0.2.0/` (or whatever tag you want).
 
 #### macOS: running the unsigned binary
 
@@ -53,7 +57,7 @@ Gatekeeper will refuse to run them by default. Two mitigation options:
 
 ```sh
 curl -L -o gitea2forgejo \
-  https://github.com/pacnpal/gitea2forgejo/releases/download/v0.1.0/gitea2forgejo-darwin-arm64
+  https://github.com/pacnpal/gitea2forgejo/releases/latest/download/gitea2forgejo-darwin-arm64
 xattr -dr com.apple.quarantine gitea2forgejo      # remove Gatekeeper flag
 chmod +x gitea2forgejo
 ./gitea2forgejo --version
@@ -101,13 +105,20 @@ system-wide and is stronger than you want.
 # Install once.
 go install github.com/slsa-framework/slsa-verifier/v2/cli/slsa-verifier@latest
 
-# Fetch binary + its provenance, then verify.
-VERSION=v0.1.0
 PLATFORM=linux-amd64
+
+# Fetch binary + its provenance from the latest release.
 curl -L -o gitea2forgejo-$PLATFORM \
-  https://github.com/pacnpal/gitea2forgejo/releases/download/$VERSION/gitea2forgejo-$PLATFORM
+  https://github.com/pacnpal/gitea2forgejo/releases/latest/download/gitea2forgejo-$PLATFORM
 curl -L -o gitea2forgejo-$PLATFORM.intoto.jsonl \
-  https://github.com/pacnpal/gitea2forgejo/releases/download/$VERSION/gitea2forgejo-$PLATFORM.intoto.jsonl
+  https://github.com/pacnpal/gitea2forgejo/releases/latest/download/gitea2forgejo-$PLATFORM.intoto.jsonl
+
+# slsa-verifier needs the exact tag to cross-check against; resolve it from
+# the release API in one step.
+VERSION=$(gh release view --repo pacnpal/gitea2forgejo --json tagName --jq .tagName)
+# Or without gh:
+# VERSION=$(curl -sI https://github.com/pacnpal/gitea2forgejo/releases/latest | \
+#   awk -F/ '/^location:/ {print $NF}' | tr -d '\r')
 
 slsa-verifier verify-artifact \
   --provenance-path gitea2forgejo-$PLATFORM.intoto.jsonl \
@@ -150,18 +161,20 @@ https://github.com/pacnpal/gitea2forgejo/releases.
 
 ### Update a release binary
 
-Same `curl` as initial install, overwriting the file in place. Update
-`VERSION` and `PLATFORM` first.
+Same `curl` as initial install, overwriting the file in place. Uses the
+`/latest/` URL so you never need to edit the version:
 
 ```sh
-VERSION=v0.1.2
 PLATFORM=linux-amd64
 curl -L -o /tmp/gitea2forgejo \
-  https://github.com/pacnpal/gitea2forgejo/releases/download/$VERSION/gitea2forgejo-$PLATFORM
+  https://github.com/pacnpal/gitea2forgejo/releases/latest/download/gitea2forgejo-$PLATFORM
 chmod +x /tmp/gitea2forgejo
 sudo mv /tmp/gitea2forgejo /usr/local/bin/gitea2forgejo
 gitea2forgejo --version          # confirm new version shown
 ```
+
+Pin to a specific tag by swapping `/latest/download/` for
+`/download/vX.Y.Z/`.
 
 On macOS, reapply the Gatekeeper mitigation (`xattr -dr com.apple.quarantine`
 or `codesign --force --sign -`) after downloading the new binary — the
@@ -264,7 +277,7 @@ version for Linux:
 
 ```sh
 curl -L -o gitea2forgejo \
-  https://github.com/pacnpal/gitea2forgejo/releases/download/v0.1.0/gitea2forgejo-linux-amd64
+  https://github.com/pacnpal/gitea2forgejo/releases/latest/download/gitea2forgejo-linux-amd64
 chmod +x gitea2forgejo && sudo mv gitea2forgejo /usr/local/bin/
 gitea2forgejo --version
 ```
