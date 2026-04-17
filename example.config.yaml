@@ -98,8 +98,10 @@ target:
     region: us-east-1
 
 # Local directory for dump tarballs, manifests, checkpoint state, reports.
-# Needs free space >= 2x source data_dir size.
-work_dir: /var/cache/gitea2forgejo
+# Needs free space >= 2x source data_dir size. Defaults to
+# ./gitea2forgejo-work (relative to wherever you run the binary) so the
+# tool works without sudo or pre-created directories.
+work_dir: ./gitea2forgejo-work
 
 # URL rewrites applied during `supplement` phase to webhook URLs,
 # OAuth2 callback URLs, and mirror URLs.

@@ -127,12 +127,42 @@ func checkVersion(r *Result, inst config.Instance, kind client.Kind, log *slog.L
 				Detail: v + " — drop-in upgrade is supported for ≤1.22. Consider Forgejo's official path."})
 			return
 		}
-		if !strings.HasPrefix(v, "1.23") && !strings.HasPrefix(v, "1.24") {
-			r.add(Check{Name: "source: version", Status: "WARN", Detail: "unexpected version " + v})
+		// Source Gitea 1.23+ is what this tool targets. Anything newer
+		// is fine; we parse on an INI basis and the schema trick works
+		// across minor bumps. Warn on unknown major.
+		if !strings.HasPrefix(v, "1.") {
+			r.add(Check{Name: "source: version", Status: "WARN", Detail: "unexpected non-1.x version " + v})
+			return
+		}
+	}
+	if kind == client.KindTarget {
+		// Forgejo reports something like "11.0.12+gitea-1.22.0" or
+		// "15.0.0+gitea-1.24.0". Extract the leading Forgejo major.
+		major := forgejoMajor(v)
+		if major > 0 && major < 15 {
+			r.add(Check{Name: "target: version", Status: "WARN",
+				Detail: v + " — tool was designed for Forgejo v15+; the schema-trick number (305) may need adjustment for older targets"})
 			return
 		}
 	}
 	r.add(Check{Name: string(kind) + ": version", Status: "PASS", Detail: v})
+}
+
+// forgejoMajor extracts the leading major version from a Forgejo version
+// string like "11.0.12+gitea-1.22.0" → 11. Returns 0 if unparseable.
+func forgejoMajor(v string) int {
+	dot := strings.Index(v, ".")
+	if dot <= 0 {
+		return 0
+	}
+	n := 0
+	for _, c := range v[:dot] {
+		if c < '0' || c > '9' {
+			return 0
+		}
+		n = n*10 + int(c-'0')
+	}
+	return n
 }
 
 func checkSSH(r *Result, label string, ssh *config.SSH, log *slog.Logger) *remote.Client {

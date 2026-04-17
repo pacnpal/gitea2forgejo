@@ -9,7 +9,6 @@ import (
 
 	"gopkg.in/yaml.v3"
 
-	"github.com/pacnpal/gitea2forgejo/internal/appini"
 	"github.com/pacnpal/gitea2forgejo/internal/config"
 )
 
@@ -18,18 +17,18 @@ import (
 // everything else).
 func buildConfig(
 	opt *Options,
-	src *appini.Summary, srcContainer string,
-	tgt *appini.Summary, tgtContainer string,
+	src *ProbeResult,
+	tgt *ProbeResult,
 ) *config.Config {
 	c := &config.Config{
 		WorkDir: opt.WorkDir,
 	}
 	populateInstance(&c.Source, "source", opt.SourceURL, opt.SourceToken, opt.InsecureTLS,
 		opt.SourceSSHHost, opt.SourceSSHPort, opt.SourceSSHUser, opt.SourceSSHKey,
-		opt.SourceAppIni, srcContainer, src)
+		opt.SourceAppIni, src)
 	populateInstance(&c.Target, "target", opt.TargetURL, opt.TargetToken, opt.InsecureTLS,
 		opt.TargetSSHHost, opt.TargetSSHPort, opt.TargetSSHUser, opt.TargetSSHKey,
-		opt.TargetAppIni, tgtContainer, tgt)
+		opt.TargetAppIni, tgt)
 	// Default target paths when the target had no discoverable app.ini
 	// (very common for a fresh Forgejo that hasn't been initialized).
 	if c.Target.ConfigFile == "" {
@@ -56,8 +55,8 @@ func populateInstance(
 	inst *config.Instance, label string,
 	apiURL, token string, insecureTLS bool,
 	sshHost string, sshPort int, sshUser, sshKey string,
-	appIniOverride, container string,
-	s *appini.Summary,
+	appIniOverride string,
+	probe *ProbeResult,
 ) {
 	inst.URL = apiURL
 	inst.InsecureTLS = insecureTLS
@@ -70,22 +69,47 @@ func populateInstance(
 		Host: sshHost, Port: sshPort, User: sshUser, Key: sshKey,
 		KnownHosts: "",
 	}
-	if s != nil {
+
+	container := ""
+	mounts := []Mount{}
+	if probe != nil {
+		container = probe.Container
+		mounts = probe.Mounts
+	}
+
+	// ConfigFile: prefer an explicit override, then the host path the
+	// probe resolved via docker inspect, then a reasonable default.
+	switch {
+	case appIniOverride != "":
 		inst.ConfigFile = appIniOverride
-		if inst.ConfigFile == "" && container != "" {
-			inst.ConfigFile = "/data/gitea/conf/app.ini" // container-internal default
-		}
-		inst.DataDir = s.AppDataPath
-		inst.RepoRoot = s.RepoRoot
+	case probe != nil && probe.HostAppIniPath != "":
+		inst.ConfigFile = probe.HostAppIniPath
+	case container != "":
+		inst.ConfigFile = "/data/gitea/conf/app.ini" // last-resort container path
+	}
+
+	if probe != nil && probe.Summary != nil {
+		s := probe.Summary
+		// Translate container-internal paths to HOST paths. `gitea2forgejo`
+		// always operates via SSH on the host; container-internal paths
+		// won't exist for filesystem operations.
+		inst.DataDir = TranslateToHost(s.AppDataPath, mounts)
+		inst.RepoRoot = TranslateToHost(s.RepoRoot, mounts)
+
 		inst.DB = config.DB{Dialect: s.DBType}
-		if dsn, err := s.BuildDSN(""); err == nil {
-			// Prefer env-var indirection for the DSN if it's got a password.
+		if s.DBType == "sqlite3" {
+			// SQLite file is a path; translate it too so preflight can
+			// `cli.FetchFile` or rsync it via a HOST path.
+			inst.DB.DSN = TranslateToHost(s.DBPath, mounts)
+		} else if dsn, err := s.BuildDSN(""); err == nil {
+			// Postgres/MySQL DSNs contain a password; stash under env.
 			if s.DBPassword != "" {
 				inst.DB.DSN = "env:" + strings.ToUpper(label) + "_DB_DSN"
 			} else {
 				inst.DB.DSN = dsn
 			}
 		}
+
 		if s.StorageType == "minio" || s.StorageType == "s3" {
 			inst.Storage = &config.Storage{
 				Type:      "s3",

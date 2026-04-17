@@ -64,7 +64,7 @@ func Run(opt *Options, log *slog.Logger) error {
 	}
 
 	log.Info("init: probing source", "url", opt.SourceURL, "ssh", opt.SourceSSHHost)
-	srcSummary, srcContainer, err := probe(
+	src, err := probe(
 		opt.SourceURL, opt.InsecureTLS,
 		opt.SourceSSHHost, opt.SourceSSHPort, opt.SourceSSHUser, opt.SourceSSHKey,
 		opt.SourceAppIni, opt.SourceContainer, log,
@@ -76,13 +76,16 @@ func Run(opt *Options, log *slog.Logger) error {
 	// Target probe is best-effort — target Forgejo may not have an app.ini
 	// yet if it's fresh, or it may refuse API calls until the setup wizard
 	// is run. We fall back to sensible defaults.
-	tgtSummary, tgtContainer, _ := probe(
+	tgt, _ := probe(
 		opt.TargetURL, opt.InsecureTLS,
 		opt.TargetSSHHost, opt.TargetSSHPort, opt.TargetSSHUser, opt.TargetSSHKey,
 		opt.TargetAppIni, opt.TargetContainer, log,
 	)
+	if tgt == nil {
+		tgt = &ProbeResult{}
+	}
 
-	cfg := buildConfig(opt, srcSummary, srcContainer, tgtSummary, tgtContainer)
+	cfg := buildConfig(opt, src, tgt)
 	return writeYAML(cfg, opt.Output, log)
 }
 
@@ -141,7 +144,7 @@ func (opt *Options) validate() error {
 		opt.Output = "config.yaml"
 	}
 	if opt.WorkDir == "" {
-		opt.WorkDir = "/var/cache/gitea2forgejo"
+		opt.WorkDir = "./gitea2forgejo-work"
 	}
 	if opt.SourceSSHPort == 0 {
 		opt.SourceSSHPort = 22
@@ -155,6 +158,46 @@ func (opt *Options) validate() error {
 	return nil
 }
 
+// ProbeResult is everything we learned about one side.
+type ProbeResult struct {
+	Summary        *appini.Summary
+	Container      string
+	HostAppIniPath string   // HOST path to app.ini (for SSH/SFTP reads)
+	Mounts         []Mount  // container<->host bind mappings (Docker only)
+}
+
+// Mount is one bind-mount record from `docker inspect`.
+type Mount struct {
+	ContainerPath string // e.g. /data
+	HostPath      string // e.g. /mnt/user/appdata/forgejo
+}
+
+// TranslateToHost converts a container-internal path into its host-side
+// equivalent by finding the longest-prefix mount that matches. If no mount
+// matches, returns p unchanged — caller should treat that as "couldn't
+// translate" rather than "it's already a host path."
+func TranslateToHost(p string, mounts []Mount) string {
+	if p == "" {
+		return p
+	}
+	p = strings.TrimRight(p, "/")
+	best := -1
+	for i, m := range mounts {
+		cp := strings.TrimRight(m.ContainerPath, "/")
+		if p == cp || strings.HasPrefix(p, cp+"/") {
+			if best < 0 || len(cp) > len(strings.TrimRight(mounts[best].ContainerPath, "/")) {
+				best = i
+			}
+		}
+	}
+	if best < 0 {
+		return p
+	}
+	m := mounts[best]
+	rel := strings.TrimPrefix(p, strings.TrimRight(m.ContainerPath, "/"))
+	return path.Clean(strings.TrimRight(m.HostPath, "/") + rel)
+}
+
 // probe connects to the API (returns early if token was supplied to verify
 // access), then SSHes to the host, auto-discovers the app.ini, parses it,
 // and optionally detects a Docker container.
@@ -163,7 +206,7 @@ func probe(
 	sshHost string, sshPort int, sshUser, sshKey string,
 	appIniPath, containerName string,
 	log *slog.Logger,
-) (*appini.Summary, string, error) {
+) (*ProbeResult, error) {
 	if apiURL != "" {
 		if err := pingAPI(apiURL, insecureTLS); err != nil {
 			log.Warn("API not reachable (non-fatal for init)", "url", apiURL, "err", err)
@@ -174,26 +217,40 @@ func probe(
 		KnownHosts: defaultKnownHosts(),
 	})
 	if err != nil {
-		return nil, "", fmt.Errorf("ssh dial: %w", err)
+		return nil, fmt.Errorf("ssh dial: %w", err)
 	}
 	defer cli.Close()
+
+	res := &ProbeResult{}
 
 	// 1. Detect Docker container if not explicitly provided.
 	if containerName == "" {
 		containerName = autodetectContainer(cli, log)
 	}
+	res.Container = containerName
 
-	// 2. Locate app.ini. Inside Docker, use `docker inspect` to find the
-	//    bind-mounted path on the host; outside, try common paths.
-	iniPath, iniBytes, err := locateAppIni(cli, appIniPath, containerName, log)
+	// 2. If Docker, pull bind-mount metadata up front so later logic can
+	//    translate container paths to host paths.
+	if containerName != "" {
+		mounts, err := dockerMounts(cli, containerName)
+		if err != nil {
+			log.Warn("docker inspect failed (continuing without mounts)", "err", err)
+		} else {
+			res.Mounts = mounts
+		}
+	}
+
+	// 3. Locate app.ini.
+	iniPath, iniBytes, err := locateAppIni(cli, appIniPath, containerName, res.Mounts, log)
 	if err != nil {
-		return nil, containerName, fmt.Errorf("locate app.ini: %w", err)
+		return res, fmt.Errorf("locate app.ini: %w", err)
 	}
 	log.Info("init: found app.ini", "path", iniPath)
+	res.HostAppIniPath = iniPath
 
-	// 3. Parse.
-	s := appini.Summarize(appini.Flat(iniBytes))
-	return s, containerName, nil
+	// 4. Parse.
+	res.Summary = appini.Summarize(appini.Flat(iniBytes))
+	return res, nil
 }
 
 func pingAPI(base string, insecureTLS bool) error {
@@ -247,22 +304,28 @@ func autodetectContainer(cli *remote.Client, log *slog.Logger) string {
 	return best
 }
 
-// locateAppIni resolves the path to app.ini on the host. For Docker
-// containers, it queries `docker inspect` for the bind mount that maps
-// into /data or /etc/gitea. Without Docker, it tries common paths.
-func locateAppIni(cli *remote.Client, explicit, container string, log *slog.Logger) (string, []byte, error) {
+// locateAppIni resolves the HOST path to app.ini. For Docker containers,
+// it tries a few well-known container-internal paths and uses the mounts
+// list to translate them to host paths. Without Docker, it tries common
+// host paths directly.
+func locateAppIni(cli *remote.Client, explicit, container string, mounts []Mount, log *slog.Logger) (string, []byte, error) {
 	if explicit != "" {
 		data, err := cli.ReadFile(explicit)
 		return explicit, data, err
 	}
-	if container != "" {
-		p, err := dockerHostAppIni(cli, container, log)
-		if err == nil && p != "" {
-			data, err := cli.ReadFile(p)
-			if err == nil {
-				return p, data, nil
+	if container != "" && len(mounts) > 0 {
+		for _, inside := range []string{
+			"/data/gitea/conf/app.ini",
+			"/etc/gitea/app.ini",
+			"/var/lib/forgejo/custom/conf/app.ini",
+		} {
+			hostPath := TranslateToHost(inside, mounts)
+			if hostPath == inside { // no mount matched
+				continue
 			}
-			log.Warn("docker-resolved app.ini not readable", "path", p, "err", err)
+			if data, err := cli.ReadFile(hostPath); err == nil {
+				return hostPath, data, nil
+			}
 		}
 	}
 	// Fallback: common paths on a non-Docker install.
@@ -280,44 +343,25 @@ func locateAppIni(cli *remote.Client, explicit, container string, log *slog.Logg
 	return "", nil, fmt.Errorf("app.ini not found at any known location; pass --source-app-ini to override")
 }
 
-// dockerHostAppIni returns the HOST path of the bind-mount that corresponds
-// to the container's /data/gitea/conf/app.ini (or similar).
-//
-// Uses `docker inspect --format` to dump the Mounts array in a format we
-// can parse.
-func dockerHostAppIni(cli *remote.Client, container string, log *slog.Logger) (string, error) {
+// dockerMounts returns all bind-mounts from `docker inspect` for the named
+// container, suitable for TranslateToHost.
+func dockerMounts(cli *remote.Client, container string) ([]Mount, error) {
 	out, err := cli.Run(fmt.Sprintf(
 		"docker inspect --format '{{range .Mounts}}{{.Source}}\t{{.Destination}}\n{{end}}' %s",
 		shQuote(container),
 	))
 	if err != nil {
-		return "", err
+		return nil, err
 	}
-	// We want the mount whose destination tree would contain app.ini —
-	// typically destination = /data (official gitea/forgejo images)
-	// or /etc/gitea.
-	candidates := [][2]string{
-		{"/data/gitea/conf/app.ini", "/data"},
-		{"/etc/gitea/app.ini", "/etc/gitea"},
-		{"/var/lib/forgejo/custom/conf/app.ini", "/var/lib/forgejo"},
-	}
-	lines := strings.Split(string(out), "\n")
-	for _, line := range lines {
+	var ms []Mount
+	for _, line := range strings.Split(string(out), "\n") {
 		fields := strings.Split(strings.TrimSpace(line), "\t")
-		if len(fields) != 2 {
+		if len(fields) != 2 || fields[0] == "" || fields[1] == "" {
 			continue
 		}
-		src, dst := fields[0], strings.TrimRight(fields[1], "/")
-		for _, c := range candidates {
-			inside, mount := c[0], c[1]
-			if dst == mount {
-				// Translate inside-container path to host path under src.
-				rel := strings.TrimPrefix(inside, mount)
-				return path.Clean(src + rel), nil
-			}
-		}
+		ms = append(ms, Mount{HostPath: fields[0], ContainerPath: fields[1]})
 	}
-	return "", nil
+	return ms, nil
 }
 
 func defaultKnownHosts() string {

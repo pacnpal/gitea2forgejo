@@ -137,7 +137,7 @@ run 'gitea2forgejo preflight --config config.yaml'.`,
 
 	var sharedKey string
 	cmd.Flags().StringVar(&sharedKey, "ssh-key", "", "SSH private key used for both hosts (default ~/.ssh/id_ed25519)")
-	cmd.Flags().StringVar(&opt.WorkDir, "work-dir", "/var/cache/gitea2forgejo", "local scratch directory for dump artifacts")
+	cmd.Flags().StringVar(&opt.WorkDir, "work-dir", "./gitea2forgejo-work", "local scratch directory for dump artifacts")
 	cmd.Flags().StringVarP(&opt.Output, "output", "o", "config.yaml", "path to write the generated config")
 	cmd.Flags().BoolVar(&opt.InsecureTLS, "insecure-tls", false, "skip TLS verification for source/target APIs")
 

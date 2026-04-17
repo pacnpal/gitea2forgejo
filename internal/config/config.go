@@ -153,6 +153,9 @@ func Load(path string) (*Config, error) {
 	if c.Options.DumpFormat == "" {
 		c.Options.DumpFormat = "tar.zst"
 	}
+	if c.WorkDir == "" {
+		c.WorkDir = "./gitea2forgejo-work"
+	}
 	if c.Source.Binary == "" {
 		c.Source.Binary = "gitea"
 	}
@@ -230,9 +233,8 @@ func (c *Config) validate() error {
 			errs = append(errs, label+": ssh.host is required when ssh block is present")
 		}
 	}
-	if c.WorkDir == "" {
-		errs = append(errs, "work_dir is required")
-	}
+	// work_dir can be empty — we fill in a CWD-local default during
+	// resolve(). Keep the validator quiet about it.
 	switch c.Options.DumpFormat {
 	case "", "tar.zst", "tar.gz", "tar", "zip":
 	default:
