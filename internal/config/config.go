@@ -48,6 +48,16 @@ type SSH struct {
 	Port int    `yaml:"port"`
 	User string `yaml:"user"`
 	Key  string `yaml:"key"`
+
+	// KnownHosts is the path to an OpenSSH-format known_hosts file used to
+	// verify the remote host key. Defaults to ~/.ssh/known_hosts.
+	KnownHosts string `yaml:"known_hosts"`
+
+	// HostKeyFingerprint is an optional SHA256 fingerprint (as printed by
+	// `ssh-keygen -lf key.pub`, e.g. "SHA256:AbCdEf..."). When set, it is
+	// checked in addition to KnownHosts; useful in CI where no known_hosts
+	// file exists.
+	HostKeyFingerprint string `yaml:"host_key_fingerprint"`
 }
 
 type DB struct {
@@ -124,6 +134,14 @@ func (c *Config) resolve() error {
 			inst.SSH.Key = expandHome(inst.SSH.Key)
 			if inst.SSH.Port == 0 {
 				inst.SSH.Port = 22
+			}
+			if inst.SSH.KnownHosts == "" {
+				home, err := os.UserHomeDir()
+				if err == nil {
+					inst.SSH.KnownHosts = filepath.Join(home, ".ssh", "known_hosts")
+				}
+			} else {
+				inst.SSH.KnownHosts = expandHome(inst.SSH.KnownHosts)
 			}
 		}
 		if inst.Storage != nil {

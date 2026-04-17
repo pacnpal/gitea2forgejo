@@ -3,6 +3,7 @@ package remote
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/pkg/sftp"
 	"golang.org/x/crypto/ssh"
+	"golang.org/x/crypto/ssh/knownhosts"
 
 	"github.com/pacnpal/gitea2forgejo/internal/config"
 )
@@ -25,6 +27,15 @@ type Client struct {
 
 // Dial opens an SSH connection with the settings from config.SSH.
 // The caller must Close() when done.
+//
+// Host key verification order:
+//  1. If HostKeyFingerprint is set, the advertised key's SHA256 fingerprint
+//     must match.
+//  2. Otherwise KnownHosts (defaulting to ~/.ssh/known_hosts) is consulted
+//     via golang.org/x/crypto/ssh/knownhosts.
+//
+// There is intentionally no "trust on first use" fallback — if neither
+// mechanism can authenticate the host, Dial returns an error.
 func Dial(c *config.SSH) (*Client, error) {
 	if c == nil {
 		return nil, fmt.Errorf("ssh block is nil")
@@ -37,10 +48,14 @@ func Dial(c *config.SSH) (*Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("parse key: %w", err)
 	}
+	hkCallback, err := hostKeyCallback(c)
+	if err != nil {
+		return nil, err
+	}
 	cfg := &ssh.ClientConfig{
 		User:            c.User,
 		Auth:            []ssh.AuthMethod{ssh.PublicKeys(signer)},
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(), // intentional: one-time migration, operator trusts both hosts
+		HostKeyCallback: hkCallback,
 		Timeout:         15 * time.Second,
 	}
 	addr := net.JoinHostPort(c.Host, strconv.Itoa(c.Port))
@@ -54,6 +69,50 @@ func Dial(c *config.SSH) (*Client, error) {
 		return nil, fmt.Errorf("sftp new: %w", err)
 	}
 	return &Client{ssh: sshClient, sftp: sftpClient, addr: addr}, nil
+}
+
+// hostKeyCallback returns an ssh.HostKeyCallback that verifies the remote
+// host key against an explicit fingerprint (if configured) or a known_hosts
+// file. Returns an error if neither source is usable — never returns
+// ssh.InsecureIgnoreHostKey().
+func hostKeyCallback(c *config.SSH) (ssh.HostKeyCallback, error) {
+	// Pin 1: explicit fingerprint. Independent of any file on disk.
+	if fp := strings.TrimSpace(c.HostKeyFingerprint); fp != "" {
+		want := fp
+		return func(hostname string, remote net.Addr, key ssh.PublicKey) error {
+			got := ssh.FingerprintSHA256(key)
+			if got != want {
+				return fmt.Errorf("host key fingerprint mismatch for %s: expected %s, got %s",
+					hostname, want, got)
+			}
+			return nil
+		}, nil
+	}
+	// Pin 2: known_hosts.
+	if c.KnownHosts == "" {
+		return nil, fmt.Errorf("host key verification not configured: set ssh.known_hosts or ssh.host_key_fingerprint")
+	}
+	if _, err := os.Stat(c.KnownHosts); err != nil {
+		return nil, fmt.Errorf("known_hosts file %s: %w (add the host via `ssh-keyscan -H %s >> %s` or configure ssh.host_key_fingerprint)",
+			c.KnownHosts, err, c.Host, c.KnownHosts)
+	}
+	cb, err := knownhosts.New(c.KnownHosts)
+	if err != nil {
+		return nil, fmt.Errorf("load known_hosts %s: %w", c.KnownHosts, err)
+	}
+	// Wrap with a friendlier error for the common "host not in file" case.
+	return func(hostname string, remote net.Addr, key ssh.PublicKey) error {
+		err := cb(hostname, remote, key)
+		if err == nil {
+			return nil
+		}
+		var kerr *knownhosts.KeyError
+		if errors.As(err, &kerr) && len(kerr.Want) == 0 {
+			return fmt.Errorf("%s is not in %s; add it via `ssh-keyscan -H %s >> %s` or set ssh.host_key_fingerprint",
+				hostname, c.KnownHosts, c.Host, c.KnownHosts)
+		}
+		return err
+	}, nil
 }
 
 // Run executes cmd and returns combined stdout+stderr.
