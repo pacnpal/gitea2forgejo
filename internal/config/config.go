@@ -89,6 +89,13 @@ type Options struct {
 	SkipGiteaDump bool `yaml:"skip_gitea_dump"`
 	SkipNativeDB  bool `yaml:"skip_native_db"`
 	SkipS3Mirror  bool `yaml:"skip_s3_mirror"`
+
+	// ResetTargetDB wipes the target database before restore. Required when
+	// the operator has already run Forgejo's initial setup wizard (creating
+	// the first admin user + Forgejo-native tables that conflict with the
+	// Gitea dump). DESTRUCTIVE — only set this after confirming the target
+	// holds nothing you want to keep.
+	ResetTargetDB bool `yaml:"reset_target_db"`
 }
 
 // Load reads and validates a config file.

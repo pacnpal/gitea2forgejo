@@ -277,14 +277,18 @@ you don't want on your downtime critical path.
    SQL
    ```
 
-5. **DO NOT start Forgejo yet**, and DO NOT run its web-based initial
-   setup wizard. The target must stay at "empty DB, binary installed,
-   service stopped" until `gitea2forgejo restore` drops data into it.
-   Running the setup wizard will populate `version` + create the first
-   admin user, which breaks the import.
+5. **Ideally, do not start Forgejo yet** and do not run its web-based
+   initial setup wizard. The target is simplest when it stays at "empty DB,
+   binary installed, service stopped" until `gitea2forgejo restore` drops
+   data into it.
 
-   If you accidentally ran it: `DROP DATABASE forgejo; CREATE DATABASE…`
-   again.
+   **If you already ran the setup wizard (very common):** set
+   `options.reset_target_db: true` in `config.yaml`. `preflight` will flag
+   the pre-populated schema as a FAIL; `restore` will wipe the target DB
+   (`DROP SCHEMA public CASCADE` on Postgres, `DROP DATABASE` on MySQL,
+   `rm` the sqlite file) before importing the source dump. The reset is
+   gated behind this flag specifically because it's destructive — you
+   don't want to silently nuke a production target.
 
 6. **Leave the service stopped but enable it** so it starts automatically
    on boot:
@@ -393,6 +397,7 @@ All the information the binary needs (organized by config field):
 | `hostname_rewrites`                  | List of `{from, to}` pairs for webhook URL / OAuth callback |
 | `options.dump_format`                | `tar.zst` (default) / `tar.gz` / `tar` / `zip`              |
 | `options.skip_*`                     | Skip specific dump stages (rehearsal use)                   |
+| `options.reset_target_db`            | DESTRUCTIVE. `true` if you already ran Forgejo setup wizard |
 
 DSN formats:
 ```
@@ -429,6 +434,10 @@ is non-negotiable. If any are empty in source `app.ini`, STOP and
 regenerate them (then users will need to re-login). Proceeding without
 them means every 2FA secret, OAuth app client secret, and encrypted
 Actions secret on source becomes unrecoverable garbage.
+
+Also watch for the **target: db empty** check. If it FAILs reporting
+tables present, someone has run Forgejo's setup wizard — set
+`options.reset_target_db: true` in `config.yaml` and re-run preflight.
 
 ### Step 8 — Rehearse against a disposable pair (strongly recommended)
 

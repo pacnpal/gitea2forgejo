@@ -103,3 +103,10 @@ options:
   skip_gitea_dump: false
   skip_native_db: false
   skip_s3_mirror: false
+
+  # DESTRUCTIVE: wipe the target DB before restoring. Required if someone
+  # (accidentally or deliberately) started the target Forgejo service and
+  # ran its initial setup wizard, creating the first admin user plus
+  # Forgejo-native tables that would collide with the Gitea dump.
+  # Leave false if your target DB is genuinely empty.
+  reset_target_db: false

@@ -44,6 +44,32 @@ func Run(cfg *config.Config, log *slog.Logger) error {
 	if _, err := TranslateAppIni(cfg, log, ssh); err != nil {
 		return fmt.Errorf("translate app.ini: %w", err)
 	}
+
+	// Detect a pre-populated target DB (most commonly because the operator
+	// ran Forgejo's web setup wizard). pg_restore --clean only drops
+	// tables that are IN the source dump; Forgejo-native tables like
+	// quota_* survive and collide with forward migrations. Refuse unless
+	// the operator explicitly opts into a full reset.
+	state, err := InspectTargetDB(cfg)
+	if err != nil {
+		return fmt.Errorf("inspect target db: %w", err)
+	}
+	if !state.Empty {
+		if !cfg.Options.ResetTargetDB {
+			return fmt.Errorf("target DB is not empty (%d tables, version=%d, forgejo_extras=%v) — "+
+				"most likely Forgejo's setup wizard has been run. "+
+				"Set options.reset_target_db: true to drop + recreate the schema, "+
+				"or drop the database manually and re-run",
+				state.TableCount, state.VersionRow, state.HasForgejoExtras)
+		}
+		log.Warn("target DB not empty; resetting (options.reset_target_db is true)",
+			"tables", state.TableCount, "version", state.VersionRow,
+			"forgejo_extras", state.HasForgejoExtras)
+		if err := ResetTargetDB(cfg, log); err != nil {
+			return fmt.Errorf("reset target db: %w", err)
+		}
+	}
+
 	if err := DBImport(cfg, log); err != nil {
 		return fmt.Errorf("db import: %w", err)
 	}

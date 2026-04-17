@@ -17,6 +17,7 @@ import (
 	"github.com/pacnpal/gitea2forgejo/internal/client"
 	"github.com/pacnpal/gitea2forgejo/internal/config"
 	"github.com/pacnpal/gitea2forgejo/internal/remote"
+	"github.com/pacnpal/gitea2forgejo/internal/restore"
 )
 
 type Result struct {
@@ -61,6 +62,9 @@ func Run(cfg *config.Config, log *slog.Logger) *Result {
 	// DB reachability.
 	checkDB(r, "source", cfg.Source.DB, log)
 	checkDB(r, "target", cfg.Target.DB, log)
+
+	// Target DB emptiness (setup-wizard detection).
+	checkTargetDBEmpty(r, cfg, log)
 
 	// SECRET_KEY presence on source (reads app.ini via SSH).
 	if srcSSH != nil {
@@ -165,6 +169,28 @@ func checkDB(r *Result, label string, d config.DB, log *slog.Logger) {
 	}
 	defer db.Close()
 	r.add(Check{Name: label + ": db", Status: "PASS", Detail: d.Dialect})
+}
+
+func checkTargetDBEmpty(r *Result, cfg *config.Config, log *slog.Logger) {
+	state, err := restore.InspectTargetDB(cfg)
+	if err != nil {
+		r.add(Check{Name: "target: db empty", Status: "WARN", Detail: err.Error()})
+		return
+	}
+	if state.Empty {
+		r.add(Check{Name: "target: db empty", Status: "PASS", Detail: "0 tables — ready for restore"})
+		return
+	}
+	detail := fmt.Sprintf("%d tables present (version=%d, forgejo_extras=%v)",
+		state.TableCount, state.VersionRow, state.HasForgejoExtras)
+	if cfg.Options.ResetTargetDB {
+		r.add(Check{Name: "target: db empty", Status: "WARN",
+			Detail: detail + "; options.reset_target_db=true, will be wiped at restore"})
+		return
+	}
+	r.add(Check{Name: "target: db empty", Status: "FAIL",
+		Detail: detail + "; most likely Forgejo's setup wizard has been run. " +
+			"Set options.reset_target_db: true OR drop the database manually"})
 }
 
 func checkSecretKey(r *Result, ssh *remote.Client, configFile string, log *slog.Logger) {
