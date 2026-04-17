@@ -338,19 +338,28 @@ for CI / scripted runs.
 
 `init` does:
 
-1. **SSH bootstrap.** Tries to connect to the source host. Without
-   `--ssh-key`, it looks for `~/.ssh/id_ed25519`, `id_ecdsa`, `id_rsa`,
-   then falls back to `$SSH_AUTH_SOCK` (ssh-agent). **If nothing works
-   and you're at a TTY**, it offers to fix the problem for you:
-   ```
-   SSH to source 192.168.86.3 failed:
-     ssh dial: ...
-   Generate a new key and install it on 192.168.86.3? [Y/n]:
-   ```
-   On yes, it runs `ssh-keygen -t ed25519 -f ~/.ssh/gitea2forgejo`, then
-   `ssh-keyscan` to prime `~/.ssh/known_hosts`, then `ssh-copy-id`
-   (which prompts once for the remote password), then retries. Repeats
-   for the target host.
+1. **SSH bootstrap** — handles three common setup states automatically:
+
+   - **Host not in `~/.ssh/known_hosts`** → silently runs
+     `ssh-keyscan -H <host>` and appends the result. No prompting; it's
+     safe because a CONFLICTING host key would produce a different error
+     and fall through to the interactive path (we never auto-accept a
+     changed key).
+   - **Key file missing** → looks for `~/.ssh/id_ed25519`, `id_ecdsa`,
+     `id_rsa`, then falls back to `$SSH_AUTH_SOCK` (ssh-agent).
+   - **No usable credentials at all** → at a TTY, offers to fix:
+     ```
+     SSH to source 192.168.86.3 failed:
+       ssh dial: ... no usable SSH auth
+     Generate a new key and install it on 192.168.86.3? [Y/n]:
+     ```
+     On yes, it runs `ssh-keygen -t ed25519 -f ~/.ssh/gitea2forgejo`,
+     then `ssh-keyscan` to prime known_hosts, then `ssh-copy-id` (which
+     prompts once for the remote password), then retries. Repeats for
+     the target host.
+
+   On non-TTY stdin (CI/scripted), interactive prompts are skipped; the
+   silent known_hosts fix still applies.
 2. Runs `docker ps` on the remote to detect whether Gitea is in a
    container (and if so, `docker inspect` to resolve the bind-mounted
    `app.ini` path).
