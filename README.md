@@ -137,6 +137,65 @@ go build -o gitea2forgejo ./cmd/gitea2forgejo
 Requires Go 1.26+. The binary is fully static (`CGO_ENABLED=0`) and works on
 any linux/amd64 host.
 
+## Updating
+
+Check what's running:
+
+```sh
+gitea2forgejo --version
+```
+
+See what's new for each release at
+https://github.com/pacnpal/gitea2forgejo/releases.
+
+### Update a release binary
+
+Same `curl` as initial install, overwriting the file in place. Update
+`VERSION` and `PLATFORM` first.
+
+```sh
+VERSION=v0.1.2
+PLATFORM=linux-amd64
+curl -L -o /tmp/gitea2forgejo \
+  https://github.com/pacnpal/gitea2forgejo/releases/download/$VERSION/gitea2forgejo-$PLATFORM
+chmod +x /tmp/gitea2forgejo
+sudo mv /tmp/gitea2forgejo /usr/local/bin/gitea2forgejo
+gitea2forgejo --version          # confirm new version shown
+```
+
+On macOS, reapply the Gatekeeper mitigation (`xattr -dr com.apple.quarantine`
+or `codesign --force --sign -`) after downloading the new binary — the
+quarantine flag is set on the new download even if you cleared it on the
+old one.
+
+### Update a `go install` binary
+
+```sh
+go install github.com/pacnpal/gitea2forgejo/cmd/gitea2forgejo@latest
+```
+
+Or pin to a specific version: `…@v0.1.2`.
+
+### Update a source build
+
+```sh
+cd /path/to/gitea2forgejo
+git fetch --tags
+git checkout v0.1.2                 # or: git checkout main
+go build -o gitea2forgejo ./cmd/gitea2forgejo
+```
+
+### Upgrade during an in-flight migration
+
+Once you've run `dump` against a source, prefer finishing that migration with
+the **same** binary version that produced the dump. Upgrading between `dump`
+and `restore` is low-risk on patch bumps (everything in `work_dir` is plain
+files + JSON), but newer versions may add manifest fields the old `restore`
+doesn't know about.
+
+Breaking changes that would affect in-flight runs are flagged as **MAJOR**
+version bumps in the release notes.
+
 ## Subcommands
 
 | Command      | Status      | Purpose                                                        |
