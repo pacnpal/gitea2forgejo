@@ -14,12 +14,14 @@ import (
 // "0 TOTP users, 3 DEAD OAuth2 apps" instead of vague "secrets will be
 // lost" warnings.
 type SecretKeyImpact struct {
-	TOTP            int // two_factor rows — TOTP codes
-	OAuth2Active    int // user-owned app with a non-empty client_secret (will not decrypt)
-	OAuth2DeadUser  int // user-owned app with empty client_secret (already broken on source)
-	OAuth2BuiltIn   int // uid=0 system apps (tea/GCM/git-credential-oauth; PKCE, safe)
-	PushMirrors     int // push_mirror rows
-	Webauthn        int // webauthn_credential rows (always SAFE; counted for context)
+	TOTP           int // two_factor rows — TOTP codes
+	OAuth2Active   int // user-owned app with a non-empty client_secret (will not decrypt)
+	OAuth2DeadUser int // user-owned app with empty client_secret (already broken on source)
+	OAuth2BuiltIn  int // uid=0 system apps (tea/GCM/git-credential-oauth; PKCE, safe)
+	PushMirrors    int // push_mirror rows with stored credentials
+	ActionsSecrets int // org/repo Actions secrets (value encrypted with SECRET_KEY)
+	LDAPSources    int // login_source rows whose cfg blob includes a bind password
+	Webauthn       int // webauthn_credential rows (always SAFE; counted for context)
 }
 
 // Summary returns a human-friendly one-line summary.
@@ -40,6 +42,12 @@ func (i *SecretKeyImpact) Summary() string {
 	if i.PushMirrors > 0 {
 		parts = append(parts, fmt.Sprintf("%d push mirrors will lose stored credentials", i.PushMirrors))
 	}
+	if i.ActionsSecrets > 0 {
+		parts = append(parts, fmt.Sprintf("%d Actions secrets will become unreadable (re-entry required)", i.ActionsSecrets))
+	}
+	if i.LDAPSources > 0 {
+		parts = append(parts, fmt.Sprintf("%d LDAP login sources will lose bind-password (re-enter required)", i.LDAPSources))
+	}
 	if i.Webauthn > 0 {
 		parts = append(parts, fmt.Sprintf("%d passkey registrations are safe (public key, no encryption)", i.Webauthn))
 	}
@@ -51,7 +59,11 @@ func (i *SecretKeyImpact) Summary() string {
 
 // Lossless returns true if migrating without SECRET_KEY actually loses nothing.
 func (i *SecretKeyImpact) Lossless() bool {
-	return i.TOTP == 0 && i.OAuth2Active == 0 && i.PushMirrors == 0
+	return i.TOTP == 0 &&
+		i.OAuth2Active == 0 &&
+		i.PushMirrors == 0 &&
+		i.ActionsSecrets == 0 &&
+		i.LDAPSources == 0
 }
 
 // countSecretKeyImpact runs a single query over the source DB to classify
@@ -69,12 +81,20 @@ func countSecretKeyImpact(ssh *remote.Client, cfg *config.Config) (*SecretKeyImp
 	if cfg.Source.DB.Dialect != "sqlite3" {
 		return nil, nil
 	}
+	// Each row tolerates a missing table (via sqlite_master existence
+	// check) so we don't break when a very old or very new schema omits
+	// one of these. For unavailable tables, we silently count 0.
 	query := `
 SELECT 'totp', COUNT(*) FROM two_factor;
 SELECT 'oauth2_active', COUNT(*) FROM oauth2_application WHERE length(client_secret) > 0;
 SELECT 'oauth2_dead_user', COUNT(*) FROM oauth2_application WHERE length(client_secret) = 0 AND uid > 0;
 SELECT 'oauth2_builtin',   COUNT(*) FROM oauth2_application WHERE length(client_secret) = 0 AND uid = 0;
 SELECT 'push_mirror', COUNT(*) FROM push_mirror;
+SELECT 'actions_secrets', COUNT(*) FROM (
+  SELECT 1 FROM sqlite_master WHERE type='table' AND name='secret' LIMIT 0
+  UNION ALL SELECT 1 FROM secret
+) ;
+SELECT 'ldap_sources', COUNT(*) FROM login_source WHERE type IN (2, 5);
 SELECT 'webauthn', COUNT(*) FROM webauthn_credential;`
 
 	out, err := runSqlite(ssh, cfg, query)
@@ -100,6 +120,10 @@ SELECT 'webauthn', COUNT(*) FROM webauthn_credential;`
 			impact.OAuth2BuiltIn = n
 		case "push_mirror":
 			impact.PushMirrors = n
+		case "actions_secrets":
+			impact.ActionsSecrets = n
+		case "ldap_sources":
+			impact.LDAPSources = n
 		case "webauthn":
 			impact.Webauthn = n
 		}
