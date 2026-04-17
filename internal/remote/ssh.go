@@ -117,6 +117,16 @@ func buildAuth(c *config.SSH) ([]ssh.AuthMethod, error) {
 	return methods, nil
 }
 
+// ErrHostUnknown signals that the remote host is not present in the
+// known_hosts file. It is safe for callers to run `ssh-keyscan` and
+// append the result; the server is not presenting a key that conflicts
+// with a previously-recorded one.
+//
+// A MISMATCHED host key (i.e. a MITM or server re-key) returns a
+// different error and is NOT wrapped by ErrHostUnknown — callers must
+// not auto-trust in that case.
+var ErrHostUnknown = errors.New("host not in known_hosts")
+
 // hostKeyCallback returns an ssh.HostKeyCallback that verifies the remote
 // host key against an explicit fingerprint (if configured) or a known_hosts
 // file. Returns an error if neither source is usable — never returns
@@ -154,8 +164,10 @@ func hostKeyCallback(c *config.SSH) (ssh.HostKeyCallback, error) {
 		}
 		var kerr *knownhosts.KeyError
 		if errors.As(err, &kerr) && len(kerr.Want) == 0 {
-			return fmt.Errorf("%s is not in %s; add it via `ssh-keyscan -H %s >> %s` or set ssh.host_key_fingerprint",
-				hostname, c.KnownHosts, c.Host, c.KnownHosts)
+			// Wrap ErrHostUnknown so callers can errors.Is() it and
+			// decide whether to auto-scan.
+			return fmt.Errorf("%s is not in %s: %w",
+				hostname, c.KnownHosts, ErrHostUnknown)
 		}
 		return err
 	}, nil

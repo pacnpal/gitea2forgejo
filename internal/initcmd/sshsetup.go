@@ -2,6 +2,7 @@ package initcmd
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -33,6 +34,26 @@ func EnsureAuth(label string, sshCfg *config.SSH, log *slog.Logger) error {
 		cli.Close()
 		return nil
 	}
+
+	// Auto-fix #1: host not in known_hosts. Safe to ssh-keyscan silently
+	// — this only fires when there's no conflicting entry (see the
+	// ErrHostUnknown docs). A changed key would be a different error and
+	// fall through to the interactive bootstrap.
+	if errors.Is(err, remote.ErrHostUnknown) {
+		log.Info("host not in known_hosts; running ssh-keyscan",
+			"host", sshCfg.Host, "port", sshCfg.Port)
+		if scanErr := autoScan(sshCfg, log); scanErr != nil {
+			log.Warn("ssh-keyscan failed", "err", scanErr)
+		} else {
+			if cli2, retryErr := remote.Dial(sshCfg); retryErr == nil {
+				cli2.Close()
+				return nil
+			} else {
+				err = retryErr // fall through with the new error
+			}
+		}
+	}
+
 	if !term.IsTerminal(int(os.Stdin.Fd())) {
 		return err
 	}
@@ -120,6 +141,46 @@ func runVisible(w *os.File, name string, args ...string) error {
 	cmd.Stdout = w
 	cmd.Stderr = w
 	return cmd.Run()
+}
+
+// autoScan runs ssh-keyscan against sshCfg.Host and appends it to the
+// user's known_hosts file. Uses a sensible default if sshCfg.KnownHosts
+// isn't set.
+func autoScan(sshCfg *config.SSH, log *slog.Logger) error {
+	known := sshCfg.KnownHosts
+	if known == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return fmt.Errorf("resolve home: %w", err)
+		}
+		known = filepath.Join(home, ".ssh", "known_hosts")
+		if err := os.MkdirAll(filepath.Dir(known), 0o700); err != nil {
+			return fmt.Errorf("mkdir ~/.ssh: %w", err)
+		}
+		sshCfg.KnownHosts = known
+	}
+	port := sshCfg.Port
+	if port == 0 {
+		port = 22
+	}
+	cmd := exec.Command("ssh-keyscan", "-H", "-p", strconv.Itoa(port), sshCfg.Host)
+	out, err := cmd.Output()
+	if err != nil {
+		return fmt.Errorf("ssh-keyscan: %w", err)
+	}
+	if len(out) == 0 {
+		return fmt.Errorf("ssh-keyscan returned no keys")
+	}
+	f, err := os.OpenFile(known, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		return fmt.Errorf("open %s: %w", known, err)
+	}
+	defer f.Close()
+	if _, err := f.Write(out); err != nil {
+		return fmt.Errorf("append %s: %w", known, err)
+	}
+	log.Info("ssh-keyscan: added to known_hosts", "host", sshCfg.Host, "path", known)
+	return nil
 }
 
 // appendKeyscan runs ssh-keyscan and appends its output to known_hosts.
