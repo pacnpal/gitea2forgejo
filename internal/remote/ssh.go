@@ -213,21 +213,91 @@ func (c *Client) ReadFile(path string) ([]byte, error) {
 }
 
 // FetchFile downloads remotePath to localPath.
+//
+// For multi-GB dumps the copy takes minutes and gives no signal of life.
+// We stat the remote file up front to know the expected size, then emit
+// progress lines every 5 seconds so the operator can see throughput.
 func (c *Client) FetchFile(remotePath, localPath string) error {
 	src, err := c.sftp.Open(remotePath)
 	if err != nil {
 		return fmt.Errorf("open remote %s: %w", remotePath, err)
 	}
 	defer src.Close()
+	var total int64
+	if st, err := c.sftp.Stat(remotePath); err == nil {
+		total = st.Size()
+	}
 	dst, err := os.Create(localPath)
 	if err != nil {
 		return fmt.Errorf("create local %s: %w", localPath, err)
 	}
 	defer dst.Close()
-	if _, err := io.Copy(dst, src); err != nil {
+	pr := newProgressReporter(remotePath, total)
+	defer pr.done()
+	if _, err := io.Copy(io.MultiWriter(dst, pr), src); err != nil {
 		return fmt.Errorf("copy: %w", err)
 	}
 	return nil
+}
+
+// progressReporter is a minimal writer that counts bytes and periodically
+// logs "fetched X / Y (Z MB/s)". Writes are cheap (just a counter); the
+// logging lives in a goroutine started by newProgressReporter.
+type progressReporter struct {
+	path  string
+	total int64
+	seen  int64
+	start time.Time
+	stop  chan struct{}
+}
+
+func newProgressReporter(path string, total int64) *progressReporter {
+	pr := &progressReporter{
+		path:  path,
+		total: total,
+		start: time.Now(),
+		stop:  make(chan struct{}),
+	}
+	go pr.loop()
+	return pr
+}
+
+func (p *progressReporter) Write(b []byte) (int, error) {
+	p.seen += int64(len(b))
+	return len(b), nil
+}
+
+func (p *progressReporter) loop() {
+	t := time.NewTicker(5 * time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-p.stop:
+			return
+		case <-t.C:
+			p.emit()
+		}
+	}
+}
+
+func (p *progressReporter) emit() {
+	seen := p.seen
+	elapsed := time.Since(p.start).Seconds()
+	rate := float64(seen) / elapsed / (1 << 20) // MiB/s
+	if p.total > 0 {
+		pct := float64(seen) * 100 / float64(p.total)
+		fmt.Fprintf(os.Stderr, "  fetch %s: %.1f%% (%d / %d MB, %.1f MiB/s)\n",
+			p.path, pct, seen/(1<<20), p.total/(1<<20), rate)
+	} else {
+		fmt.Fprintf(os.Stderr, "  fetch %s: %d MB (%.1f MiB/s)\n",
+			p.path, seen/(1<<20), rate)
+	}
+}
+
+func (p *progressReporter) done() {
+	close(p.stop)
+	// Final summary line.
+	p.emit()
 }
 
 // WriteFile writes data to a remote path with the given mode, creating the

@@ -71,6 +71,7 @@ func giteaDumpBareMetal(cfg *config.Config, cli *remote.Client, log *slog.Logger
 	log.Info("gitea dump: remote file", "path", remotePath, "size_bytes", string(bytes.TrimSpace(stat)))
 
 	localPath := filepath.Join(cfg.WorkDir, "gitea-dump."+ext)
+	log.Info("fetching dump from host", "from", remotePath, "to", localPath)
 	fetchStart := time.Now()
 	if err := cli.FetchFile(remotePath, localPath); err != nil {
 		return "", fmt.Errorf("fetch dump: %w", err)
@@ -183,6 +184,7 @@ func giteaDumpDocker(cfg *config.Config, cli *remote.Client, log *slog.Logger) (
 	}
 
 	localPath := filepath.Join(cfg.WorkDir, "gitea-dump."+ext)
+	log.Info("fetching dump from host", "from", hostFile, "to", localPath)
 	fetchStart := time.Now()
 	if err := cli.FetchFile(hostFile, localPath); err != nil {
 		return "", fmt.Errorf("fetch dump from %s: %w", hostFile, err)
