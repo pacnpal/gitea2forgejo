@@ -38,3 +38,52 @@ func TestHostToContainer_longestPrefix(t *testing.T) {
 		t.Errorf("shallow mount should match; got %q", got)
 	}
 }
+
+func TestPickDockerScratch_prefersDataDir(t *testing.T) {
+	cfg := &cfgStub{DataDir: "/mnt/user/appdata/gitea", RemoteWorkDir: "/tmp/g"}
+	mounts := [][2]string{{"/mnt/user/appdata/gitea", "/data"}}
+	host, cont, cp := testPick(cfg, mounts)
+	if host != "/mnt/user/appdata/gitea/gitea2forgejo-dump" {
+		t.Errorf("host=%q", host)
+	}
+	if cont != "/data/gitea2forgejo-dump" {
+		t.Errorf("cont=%q", cont)
+	}
+	if cp {
+		t.Error("should not need docker cp for bind-mounted data_dir")
+	}
+}
+
+func TestPickDockerScratch_fallbackToTmp(t *testing.T) {
+	cfg := &cfgStub{DataDir: "/var/lib/gitea", RemoteWorkDir: "/tmp/g"}
+	mounts := [][2]string{{"/var/run/docker.sock", "/var/run/docker.sock"}}
+	host, cont, cp := testPick(cfg, mounts)
+	if host != "" {
+		t.Errorf("host should be empty for cp fallback, got %q", host)
+	}
+	if cont != "/tmp/gitea2forgejo-dump" {
+		t.Errorf("cont=%q", cont)
+	}
+	if !cp {
+		t.Error("should need docker cp when nothing bind-mounted")
+	}
+}
+
+// Test-only lightweight stub so we don't construct a full config.Config
+// with required DB/SSH fields.
+type cfgStub struct{ DataDir, RemoteWorkDir string }
+
+func testPick(s *cfgStub, mounts [][2]string) (string, string, bool) {
+	const subdir = "gitea2forgejo-dump"
+	if s.DataDir != "" {
+		if cc := hostToContainer(s.DataDir, mounts); cc != "" {
+			return s.DataDir + "/" + subdir, cc + "/" + subdir, false
+		}
+	}
+	if s.RemoteWorkDir != "" {
+		if cc := hostToContainer(s.RemoteWorkDir, mounts); cc != "" {
+			return s.RemoteWorkDir, cc, false
+		}
+	}
+	return "", "/tmp/" + subdir, true
+}

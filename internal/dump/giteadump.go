@@ -84,9 +84,15 @@ func giteaDumpBareMetal(cfg *config.Config, cli *remote.Client, log *slog.Logger
 	return localPath, nil
 }
 
-// giteaDumpDocker handles the Docker case: translate config paths via
-// docker inspect, run gitea dump inside the container, docker cp the
-// result out, SFTP to local.
+// giteaDumpDocker runs `gitea dump` inside a container.
+//
+// Writing the tarball to container `/tmp` is unsafe in practice — that's
+// often a small tmpfs (Docker default = 64 MiB to a few hundred MiB),
+// nowhere near enough for a multi-GB dump of a real instance. Instead we
+// prefer a SUBDIRECTORY UNDER A BIND-MOUNT so the dump lands on host-
+// backed disk with real capacity, and SFTP can read it directly from the
+// host side without any docker cp round-trip. Fallback to /tmp + docker
+// cp only when nothing is bind-mounted (vanishingly rare).
 func giteaDumpDocker(cfg *config.Config, cli *remote.Client, log *slog.Logger) (string, error) {
 	d := cfg.Source.Docker
 	ext := cfg.Options.DumpFormat
@@ -103,15 +109,16 @@ func giteaDumpDocker(cfg *config.Config, cli *remote.Client, log *slog.Logger) (
 			cfg.Source.ConfigFile, d.Container)
 	}
 
-	// Container-internal scratch path. /tmp is always present + writable.
-	internalDir := "/tmp/gitea2forgejo-dump"
-	internalFile := internalDir + "/gitea-dump." + ext
+	// Preferred scratch: a subdir under data_dir (bind-mounted → host disk).
+	// Alt 1: under remote_work_dir if it's bind-mounted.
+	// Alt 2 (fallback): container /tmp + docker cp. Space-risky.
+	hostWork, containerWork, needsDockerCp := pickDockerScratch(cfg, mounts)
 
-	// mkdir inside the container (sh -c so globbing + permissions work).
-	mkdirInner := fmt.Sprintf("mkdir -p %s && chown %s %s",
-		shQuote(internalDir),
-		shQuote(orDefault(d.User, "git")),
-		shQuote(internalDir))
+	// mkdir (and chown if we have a user) inside the container.
+	mkdirInner := fmt.Sprintf("mkdir -p %s", shQuote(containerWork))
+	if u := orDefault(d.User, "git"); u != "" {
+		mkdirInner += fmt.Sprintf(" && chown -R %s %s", shQuote(u), shQuote(containerWork))
+	}
 	mkdirCmd := fmt.Sprintf("%s exec %s sh -c %s",
 		shQuote(orDefault(d.Binary, "docker")),
 		shQuote(d.Container),
@@ -120,14 +127,18 @@ func giteaDumpDocker(cfg *config.Config, cli *remote.Client, log *slog.Logger) (
 		return "", fmt.Errorf("mkdir in container: %w", err)
 	}
 
-	// Run `gitea dump` inside the container with CONTAINER paths.
+	containerFile := path.Join(containerWork, "gitea-dump."+ext)
+
+	// Run `gitea dump` inside the container with CONTAINER paths. We also
+	// point --tempdir at the same bind-mounted directory so the staging
+	// files benefit from the host disk too.
 	inner := strings.Join([]string{
 		shQuote(orDefault(cfg.Source.Binary, "gitea")),
 		"dump",
 		"--config", shQuote(containerConfig),
-		"--file", shQuote(internalFile),
+		"--file", shQuote(containerFile),
 		"--type", shQuote(ext),
-		"--tempdir", shQuote(internalDir),
+		"--tempdir", shQuote(containerWork),
 		"--skip-log",
 		"--skip-index",
 	}, " ")
@@ -135,29 +146,38 @@ func giteaDumpDocker(cfg *config.Config, cli *remote.Client, log *slog.Logger) (
 	log.Info("gitea dump: starting (docker)",
 		"container", d.Container,
 		"container_config", containerConfig,
-		"container_file", internalFile)
+		"container_scratch", containerWork,
+		"host_scratch", hostWork,
+		"docker_cp_fallback", needsDockerCp)
 	start := time.Now()
 	if err := cli.RunStream(dumpCmd, &logWriter{log: log, prefix: "gitea-dump"}); err != nil {
 		return "", fmt.Errorf("gitea dump failed: %w", err)
 	}
 	log.Info("gitea dump: done", "elapsed", time.Since(start).Round(time.Second))
 
-	// docker cp out to a host tempfile, then SFTP to local.
-	hostTmp := fmt.Sprintf("/tmp/gitea2forgejo-dump.%s", ext)
-	cpCmd := fmt.Sprintf("%s cp %s:%s %s",
-		shQuote(orDefault(d.Binary, "docker")),
-		shQuote(d.Container),
-		shQuote(internalFile),
-		shQuote(hostTmp))
-	log.Info("docker cp: extracting dump", "src", d.Container+":"+internalFile, "dst", hostTmp)
-	if _, err := cli.Run(cpCmd); err != nil {
-		return "", fmt.Errorf("docker cp: %w", err)
+	// Locate the file on the host side so we can SFTP it.
+	var hostFile string
+	if needsDockerCp {
+		// Container /tmp → docker cp to a host temp location.
+		hostFile = fmt.Sprintf("/tmp/gitea2forgejo-dump.%s", ext)
+		cpCmd := fmt.Sprintf("%s cp %s:%s %s",
+			shQuote(orDefault(d.Binary, "docker")),
+			shQuote(d.Container),
+			shQuote(containerFile),
+			shQuote(hostFile))
+		log.Info("docker cp: extracting dump", "src", d.Container+":"+containerFile, "dst", hostFile)
+		if _, err := cli.Run(cpCmd); err != nil {
+			return "", fmt.Errorf("docker cp: %w", err)
+		}
+	} else {
+		// Bind-mounted: the file is already visible on the host at hostWork.
+		hostFile = path.Join(hostWork, "gitea-dump."+ext)
 	}
 
 	localPath := filepath.Join(cfg.WorkDir, "gitea-dump."+ext)
 	fetchStart := time.Now()
-	if err := cli.FetchFile(hostTmp, localPath); err != nil {
-		return "", fmt.Errorf("fetch dump from host tempfile: %w", err)
+	if err := cli.FetchFile(hostFile, localPath); err != nil {
+		return "", fmt.Errorf("fetch dump from %s: %w", hostFile, err)
 	}
 	if fi, err := os.Stat(localPath); err == nil {
 		log.Info("gitea dump: fetched",
@@ -165,11 +185,43 @@ func giteaDumpDocker(cfg *config.Config, cli *remote.Client, log *slog.Logger) (
 			"elapsed", time.Since(fetchStart).Round(time.Second))
 	}
 
-	// Cleanup both sides.
+	// Cleanup. Remove the container-side scratch (which also clears the
+	// host side when bind-mounted). When we used docker cp, also remove
+	// the host tempfile.
 	_, _ = cli.Run(fmt.Sprintf("%s exec %s rm -rf %s",
-		shQuote(orDefault(d.Binary, "docker")), shQuote(d.Container), shQuote(internalDir)))
-	_, _ = cli.Run("rm -f " + shQuote(hostTmp))
+		shQuote(orDefault(d.Binary, "docker")), shQuote(d.Container), shQuote(containerWork)))
+	if needsDockerCp {
+		_, _ = cli.Run("rm -f " + shQuote(hostFile))
+	}
 	return localPath, nil
+}
+
+// pickDockerScratch chooses where to land the dump output. Returns
+// (hostPath, containerPath, needsDockerCp).
+//
+// Priority:
+//  1. A subdir of cfg.Source.DataDir (guaranteed bind-mounted).
+//  2. cfg.Source.RemoteWorkDir if it's under a bind mount.
+//  3. Container /tmp (docker-cp fallback — small, only usable for
+//     very small instances).
+func pickDockerScratch(cfg *config.Config, mounts [][2]string) (hostPath, containerPath string, needsDockerCp bool) {
+	const subdir = "gitea2forgejo-dump"
+
+	if cfg.Source.DataDir != "" {
+		if cc := hostToContainer(cfg.Source.DataDir, mounts); cc != "" {
+			return path.Join(cfg.Source.DataDir, subdir),
+				path.Join(cc, subdir),
+				false
+		}
+	}
+	if cfg.Source.RemoteWorkDir != "" {
+		if cc := hostToContainer(cfg.Source.RemoteWorkDir, mounts); cc != "" {
+			return cfg.Source.RemoteWorkDir, cc, false
+		}
+	}
+	// Container /tmp — needs docker cp to get it out, and subject to
+	// tmpfs size limits.
+	return "", "/tmp/" + subdir, true
 }
 
 // inspectMounts returns all bind-mount records for a container as
