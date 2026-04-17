@@ -64,7 +64,7 @@ func Run(opt *Options, log *slog.Logger) error {
 	}
 
 	log.Info("init: probing source", "url", opt.SourceURL, "ssh", opt.SourceSSHHost)
-	src, err := probe(
+	src, err := probe(kindSource,
 		opt.SourceURL, opt.InsecureTLS,
 		opt.SourceSSHHost, opt.SourceSSHPort, opt.SourceSSHUser, opt.SourceSSHKey,
 		opt.SourceAppIni, opt.SourceContainer, log,
@@ -76,7 +76,7 @@ func Run(opt *Options, log *slog.Logger) error {
 	// Target probe is best-effort — target Forgejo may not have an app.ini
 	// yet if it's fresh, or it may refuse API calls until the setup wizard
 	// is run. We fall back to sensible defaults.
-	tgt, _ := probe(
+	tgt, _ := probe(kindTarget,
 		opt.TargetURL, opt.InsecureTLS,
 		opt.TargetSSHHost, opt.TargetSSHPort, opt.TargetSSHUser, opt.TargetSSHKey,
 		opt.TargetAppIni, opt.TargetContainer, log,
@@ -162,9 +162,17 @@ func (opt *Options) validate() error {
 type ProbeResult struct {
 	Summary        *appini.Summary
 	Container      string
-	HostAppIniPath string   // HOST path to app.ini (for SSH/SFTP reads)
-	Mounts         []Mount  // container<->host bind mappings (Docker only)
+	HostAppIniPath string  // HOST path to app.ini (for SSH/SFTP reads)
+	Mounts         []Mount // container<->host bind mappings (Docker only)
 }
+
+// kind indicates which side we're probing — affects container auto-detection.
+type kind string
+
+const (
+	kindSource kind = "gitea"   // source Gitea: prefer containers whose image contains "gitea"
+	kindTarget kind = "forgejo" // target Forgejo: prefer "forgejo"
+)
 
 // Mount is one bind-mount record from `docker inspect`.
 type Mount struct {
@@ -202,6 +210,7 @@ func TranslateToHost(p string, mounts []Mount) string {
 // access), then SSHes to the host, auto-discovers the app.ini, parses it,
 // and optionally detects a Docker container.
 func probe(
+	k kind,
 	apiURL string, insecureTLS bool,
 	sshHost string, sshPort int, sshUser, sshKey string,
 	appIniPath, containerName string,
@@ -225,7 +234,7 @@ func probe(
 
 	// 1. Detect Docker container if not explicitly provided.
 	if containerName == "" {
-		containerName = autodetectContainer(cli, log)
+		containerName = autodetectContainer(cli, k, log)
 	}
 	res.Container = containerName
 
@@ -274,15 +283,18 @@ func pingAPI(base string, insecureTLS bool) error {
 	return nil
 }
 
-// autodetectContainer tries `docker ps` on the remote host looking for a
-// container whose image or name contains "gitea" or "forgejo". Returns ""
-// if none (or if docker isn't installed).
-func autodetectContainer(cli *remote.Client, log *slog.Logger) string {
+// autodetectContainer scans `docker ps` for containers matching the
+// preferred kind. For source ("gitea"), a container whose image or name
+// contains "gitea" beats one that only contains "forgejo". For target
+// ("forgejo"), the opposite. If no strong match exists, returns "" so
+// the caller falls back to bare-metal app.ini paths.
+func autodetectContainer(cli *remote.Client, k kind, log *slog.Logger) string {
 	out, err := cli.Run(`docker ps --format '{{.Names}}\t{{.Image}}' 2>/dev/null || true`)
 	if err != nil || len(out) == 0 {
 		return ""
 	}
-	var best string
+	prefer := string(k)
+	var strong, weak []string
 	for _, line := range strings.Split(string(out), "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" {
@@ -293,15 +305,34 @@ func autodetectContainer(cli *remote.Client, log *slog.Logger) string {
 			continue
 		}
 		name, image := parts[0], strings.ToLower(parts[1])
-		if strings.Contains(image, "gitea") || strings.Contains(image, "forgejo") {
-			best = name
-			break
+		low := strings.ToLower(name)
+		switch {
+		case strings.Contains(image, prefer) || strings.Contains(low, prefer):
+			strong = append(strong, name)
+		case strings.Contains(image, "gitea") || strings.Contains(image, "forgejo") ||
+			strings.Contains(low, "gitea") || strings.Contains(low, "forgejo"):
+			weak = append(weak, name)
 		}
 	}
-	if best != "" {
-		log.Info("autodetected container", "name", best)
+	switch {
+	case len(strong) > 0:
+		if len(strong) > 1 {
+			log.Warn("multiple strong container matches; using the first",
+				"kind", prefer, "matches", strong)
+		}
+		log.Info("autodetected container", "kind", prefer, "name", strong[0])
+		return strong[0]
+	case len(weak) > 0:
+		// No strong match (container matching our kind); return empty so
+		// locateAppIni falls through to common bare-metal paths rather
+		// than silently binding to the wrong side's container. Surface
+		// what we did see so the operator can --source-container if the
+		// guess is wrong.
+		log.Warn("no container image matched the expected kind; staying bare-metal",
+			"kind", prefer, "seen_other_matches", weak)
+		return ""
 	}
-	return best
+	return ""
 }
 
 // locateAppIni resolves the HOST path to app.ini. For Docker containers,
