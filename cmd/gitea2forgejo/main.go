@@ -160,12 +160,24 @@ run 'gitea2forgejo preflight --config config.yaml'.`,
 
 // firstExistingKey walks the usual private-key filenames in ~/.ssh and
 // returns the first that exists. Empty string means "use the SSH agent."
+//
+// "gitea2forgejo" is checked FIRST because that's the name the bootstrap
+// flow (see internal/initcmd.EnsureAuth) uses when it generates a key on
+// the user's behalf. Without this, subsequent runs would re-trigger the
+// bootstrap prompt even though a working key already exists from the
+// previous run.
 func firstExistingKey() string {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return ""
 	}
-	for _, name := range []string{"id_ed25519", "id_ecdsa", "id_rsa", "id_dsa"} {
+	for _, name := range []string{
+		"gitea2forgejo", // created by our own bootstrap; always check first
+		"id_ed25519",
+		"id_ecdsa",
+		"id_rsa",
+		"id_dsa",
+	} {
 		p := filepath.Join(home, ".ssh", name)
 		if fi, err := os.Stat(p); err == nil && !fi.IsDir() {
 			return p
