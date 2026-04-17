@@ -27,7 +27,9 @@ func Doctor(ssh *remote.Client, cfg *config.Config, log *slog.Logger) error {
 		"--log-file", shQuote(logPath),
 	}
 	cmd := strings.Join(parts, " ")
-	if cfg.Target.RunAs != "" {
+	if cfg.Target.Docker != nil && cfg.Target.Docker.Container != "" {
+		cmd = wrapDockerCmd(cfg.Target.Docker, cmd)
+	} else if cfg.Target.RunAs != "" {
 		cmd = "sudo -u " + shQuote(cfg.Target.RunAs) + " -- " + cmd
 	}
 	log.Info("doctor: starting", "host", cfg.Target.SSH.Host, "cmd", cmd)
@@ -51,7 +53,9 @@ func RegenerateHooks(ssh *remote.Client, cfg *config.Config, log *slog.Logger) e
 		"--config", shQuote(cfg.Target.ConfigFile),
 	}
 	cmd := strings.Join(parts, " ")
-	if cfg.Target.RunAs != "" {
+	if cfg.Target.Docker != nil && cfg.Target.Docker.Container != "" {
+		cmd = wrapDockerCmd(cfg.Target.Docker, cmd)
+	} else if cfg.Target.RunAs != "" {
 		cmd = "sudo -u " + shQuote(cfg.Target.RunAs) + " -- " + cmd
 	}
 	log.Info("regenerate hooks: starting")

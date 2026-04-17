@@ -297,6 +297,75 @@ Additionally:
 - [skopeo](https://github.com/containers/skopeo) if your source has OCI
   container packages in its registry
 
+### Running Gitea or Forgejo in Docker
+
+If either side runs in Docker (or Podman), add a `docker:` block to that
+instance. The tool still SSHes to the **Docker host** (not the container);
+the block just wraps `gitea dump`, `forgejo doctor`, etc. in `docker exec`.
+
+```yaml
+source:
+  url: https://gitea.example.com
+  ssh:
+    host: docker-host.example.com    # the VM running Docker, not a container
+    user: root
+    key: ~/.ssh/gitea2forgejo
+  # Paths below are HOST paths — the bind-mounted volumes on the Docker
+  # host. Rsync reads from them directly; gitea dump writes to them from
+  # inside the container.
+  config_file: /srv/gitea/data/gitea/conf/app.ini
+  data_dir:    /srv/gitea/data
+  repo_root:   /srv/gitea/data/git/repositories
+  custom_dir:  /srv/gitea/data/gitea
+  remote_work_dir: /srv/gitea/data/migration   # must be bind-mounted!
+  docker:
+    container: gitea          # from `docker ps`
+    user: git                 # user inside the container
+    binary: docker            # or "podman"
+```
+
+**The critical constraint** is that `remote_work_dir` must be a host path
+that is bind-mounted at the same path inside the container. `gitea dump`
+runs inside the container and writes its tarball to that path; the host
+sees the file at the bind-mount location and SFTP fetches it from there.
+
+If your `docker-compose.yml` mounts `/srv/gitea/data → /data`, `gitea dump`
+will happily write to `/data/migration/…` inside the container, but the
+host path is `/srv/gitea/data/migration`. Set `remote_work_dir` to the
+**host** side path and make the container-internal binding match:
+
+```yaml
+# docker-compose.yml (for the source Gitea)
+services:
+  gitea:
+    image: gitea/gitea:1.23
+    volumes:
+      - /srv/gitea/data:/srv/gitea/data    # <<< bind at same path both sides
+```
+
+OR keep the container's internal `/data/...` and bind to the matching
+host path:
+
+```yaml
+services:
+  gitea:
+    volumes:
+      - /srv/gitea:/data
+# and in gitea2forgejo config:
+source:
+  data_dir: /srv/gitea                       # host side
+  remote_work_dir: /srv/gitea/migration      # host side
+  docker:
+    container: gitea
+# inside the container /data/migration is writable and appears on host
+# at /srv/gitea/migration — but the paths don't match. gitea dump
+# will write using the --file arg you pass (host path), which the
+# container sees at a different location and fails.
+# Safer: keep paths IDENTICAL on both sides via bind-mount same-path.
+```
+
+Similarly for the target Forgejo's `docker:` block.
+
 ### Step 3 — Provision the target host and install Forgejo v15
 
 **Do this before you start the cutover** — installing Forgejo takes time

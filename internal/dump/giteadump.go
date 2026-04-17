@@ -95,10 +95,23 @@ func buildGiteaDumpCmd(src config.Instance, remotePath, ext string) string {
 		"--skip-index",
 	}
 	cmd := strings.Join(parts, " ")
-	if src.RunAs != "" {
+	if src.Docker != nil && src.Docker.Container != "" {
+		cmd = wrapDockerCmd(src.Docker, cmd)
+	} else if src.RunAs != "" {
 		cmd = "sudo -u " + shQuote(src.RunAs) + " -- " + cmd
 	}
 	return cmd
+}
+
+// wrapDockerCmd wraps cmd in `docker exec -u USER CONTAINER sh -c 'cmd'`.
+// Matches the same helper in internal/restore; kept package-local to avoid
+// cycles.
+func wrapDockerCmd(d *config.Docker, cmd string) string {
+	prefix := shQuote(d.Binary) + " exec"
+	if d.User != "" {
+		prefix += " -u " + shQuote(d.User)
+	}
+	return prefix + " " + shQuote(d.Container) + " sh -c " + shQuote(cmd)
 }
 
 // shQuote single-quotes s for safe substitution into a remote shell command.

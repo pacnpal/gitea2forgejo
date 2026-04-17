@@ -28,11 +28,25 @@ source:
   custom_dir: /var/lib/gitea/custom
 
   # Path to the gitea binary on the source host; default: "gitea" in PATH.
+  # When docker block below is set, this is the binary path INSIDE the
+  # container (typically just "gitea").
   binary: gitea
   # If set, prefix `gitea dump` with `sudo -u <run_as>`. Typical value: "gitea".
+  # Ignored when docker.container is set (use docker.user instead).
   run_as: gitea
-  # Scratch dir on the source host for dump output before download.
+  # Scratch dir on the remote host for dump output before download.
+  # For Docker installs: must be a host path that is bind-mounted at the
+  # same path inside the container.
   remote_work_dir: /tmp/gitea2forgejo
+
+  # Uncomment if Gitea runs in Docker. SSH still targets the Docker HOST
+  # (not the container); this block wraps `gitea dump` in `docker exec`.
+  # Rsync + filesystem reads work unchanged against the host-side bind
+  # mounts named in data_dir / repo_root / custom_dir above.
+  # docker:
+  #   container: gitea        # from `docker ps`
+  #   user: git               # user inside the container (empty = container default)
+  #   binary: docker          # or "podman"
 
   # Native DB access. Dialect: postgres | mysql | sqlite3.
   db:
@@ -59,6 +73,12 @@ target:
     user: root
     key: ~/.ssh/id_ed25519
     known_hosts: ~/.ssh/known_hosts
+
+  # Uncomment if Forgejo runs in Docker (same semantics as source.docker).
+  # docker:
+  #   container: forgejo
+  #   user: git
+  #   binary: docker
 
   config_file: /etc/forgejo/app.ini
   data_dir: /var/lib/forgejo

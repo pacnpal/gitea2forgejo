@@ -37,10 +37,19 @@ type Instance struct {
 	// "gitea" (source) or "forgejo" (target) in PATH.
 	Binary string `yaml:"binary"`
 	// RunAs is a user to sudo to when invoking the binary; empty = no sudo.
+	// Ignored when Docker.Container is set (use Docker.User instead).
 	RunAs string `yaml:"run_as"`
 	// RemoteWorkDir is a scratch dir on the remote host for dump output
 	// before download. Must be writable by RunAs.
+	// When Docker is used: this is a HOST path that's bind-mounted into
+	// the container; `gitea dump` writes inside the container, the file
+	// appears on the host for SFTP to retrieve.
 	RemoteWorkDir string `yaml:"remote_work_dir"`
+
+	// Docker wraps binary invocations in `docker exec`. When set, SSH
+	// targets the Docker host (not the container), and Binary/RunAs are
+	// interpreted inside the container.
+	Docker *Docker `yaml:"docker"`
 }
 
 type SSH struct {
@@ -63,6 +72,33 @@ type SSH struct {
 type DB struct {
 	Dialect string `yaml:"dialect"` // postgres | mysql | sqlite3
 	DSN     string `yaml:"dsn"`
+}
+
+// Docker wraps remote binary invocations in `docker exec`.
+//
+// When set, the SSH connection still targets the Docker host (so rsync,
+// systemctl, and filesystem operations work unchanged), but `gitea dump`,
+// `forgejo doctor`, `forgejo admin regenerate hooks` etc. run inside the
+// named container.
+//
+// Path handling:
+//
+//   - RemoteWorkDir must be a HOST path that is bind-mounted INTO the
+//     container at the same path. `gitea dump --file $RemoteWorkDir/…`
+//     writes inside the container; the host sees the file at the same
+//     path via the bind mount, and the tool SFTPs it from there.
+//   - DataDir, RepoRoot, CustomDir should be the HOST paths of the
+//     container's data volumes. Rsync against the host paths directly.
+type Docker struct {
+	// Container is the container name or ID (as shown by `docker ps`).
+	Container string `yaml:"container"`
+	// User is the user inside the container to run commands as. Typically
+	// "git" for Gitea (uid 1000) and "git" for Forgejo. Empty = container
+	// default user.
+	User string `yaml:"user"`
+	// Binary is the docker CLI to invoke. Default "docker"; set to
+	// "podman" for Podman or a custom path.
+	Binary string `yaml:"binary"`
 }
 
 type Storage struct {
@@ -128,6 +164,11 @@ func Load(path string) (*Config, error) {
 	}
 	if c.Target.RemoteWorkDir == "" {
 		c.Target.RemoteWorkDir = "/tmp/gitea2forgejo"
+	}
+	for _, inst := range []*Instance{&c.Source, &c.Target} {
+		if inst.Docker != nil && inst.Docker.Binary == "" {
+			inst.Docker.Binary = "docker"
+		}
 	}
 	return &c, nil
 }
