@@ -139,27 +139,214 @@ any linux/amd64 host.
 
 ## Subcommands
 
-| Command      | Purpose                                                        |
-|--------------|----------------------------------------------------------------|
-| `preflight`  | Read-only checks: versions, SSH, DB, disk, `SECRET_KEY`.       |
-| `dump`       | `gitea dump` + native DB dump + S3 mirror + source manifest.   |
-| `restore`    | File copy, DB import, schema trick, `forgejo doctor`.          |
-| `supplement` | API fixes: hostname rewrites, runner tokens, Actions CSVs.     |
-| `verify`     | Re-harvest target manifest, diff against source, emit report.  |
-| `migrate`    | Run all five in order, with `--resume-from=<phase>`.           |
+| Command      | Status      | Purpose                                                        |
+|--------------|-------------|----------------------------------------------------------------|
+| `preflight`  | ✅ shipped  | Read-only checks: versions, SSH, DB, disk, `SECRET_KEY`.       |
+| `dump`       | ✅ shipped  | `gitea dump` + native DB dump + S3 mirror + source manifest.   |
+| `restore`    | ✅ shipped  | File copy, DB import, schema trick, `forgejo doctor`.          |
+| `supplement` | 🚧 planned  | API fixes: hostname rewrites, runner tokens, Actions CSVs.     |
+| `verify`     | 🚧 planned  | Re-harvest target manifest, diff against source, emit report.  |
+| `migrate`    | 🚧 planned  | Run all five in order, with `--resume-from=<phase>`.           |
+
+Until `migrate` lands, run `preflight` → `dump` → `restore` by hand in that
+order (see [Usage](#usage) below).
 
 ## Usage
+
+### 1. Install dependencies on the machine running the migration
+
+The tool shells out to standard utilities; install them first:
+
+```sh
+# Debian / Ubuntu
+sudo apt install rsync postgresql-client mysql-client zstd openssh-client
+
+# Fedora / RHEL
+sudo dnf install rsync postgresql mysql zstd openssh-clients
+
+# macOS (Homebrew)
+brew install rsync postgresql mysql-client zstd
+```
+
+If your source uses S3/MinIO storage, also install
+[mc](https://min.io/docs/minio/linux/reference/minio-mc.html). If you use
+OCI container packages, also install [skopeo](https://github.com/containers/skopeo).
+
+### 2. Create an admin access token on each instance
+
+On the source Gitea AND the target Forgejo:
+**User menu → Settings → Applications → Generate New Token**, tick **all**
+scopes (this is a one-time admin migration), then save each token. Export
+both, along with your DB DSNs, as environment variables:
+
+```sh
+export GITEA_ADMIN_TOKEN=gta_...
+export FORGEJO_ADMIN_TOKEN=fjo_...
+export GITEA_DB_DSN='postgres://gitea:secret@gitea-db.example.com:5432/gitea?sslmode=disable'
+export FORGEJO_DB_DSN='postgres://forgejo:secret@forgejo-db.example.com:5432/forgejo?sslmode=disable'
+```
+
+### 3. Write `config.yaml`
+
+Copy the template and edit it:
 
 ```sh
 cp example.config.yaml config.yaml
 $EDITOR config.yaml
-
-# Read-only check first.
-./gitea2forgejo preflight --config config.yaml
-
-# End-to-end migration (staging first!).
-./gitea2forgejo migrate --config config.yaml
 ```
+
+Minimum required fields: `source.url`, `source.admin_token`,
+`source.config_file`, `source.data_dir`, `source.db.dialect`, `source.db.dsn`,
+and the same five for `target`, plus a `work_dir`. Every value prefixed with
+`env:FOO` is resolved from `$FOO` at runtime, so you don't have to put
+secrets in the YAML.
+
+SSH is required for `dump` and `restore` (but not `preflight`). Add the host
+to `~/.ssh/known_hosts` once before running:
+
+```sh
+ssh-keyscan -H gitea.example.com >> ~/.ssh/known_hosts
+ssh-keyscan -H forgejo.example.com >> ~/.ssh/known_hosts
+```
+
+If you prefer not to touch `known_hosts`, pin the fingerprint directly in
+the config under `source.ssh.host_key_fingerprint` / same for `target`.
+
+### 4. Run preflight (always safe — read-only)
+
+```sh
+gitea2forgejo preflight --config config.yaml
+```
+
+Emits `$work_dir/preflight-report.md` with a GO / NO-GO decision. It checks:
+
+- Source + target API reachable and returning an expected version string
+- SSH is reachable on both hosts
+- DB connectivity on both DSNs
+- Target `work_dir` has at least 2× the source `data_dir` size of free space
+- `[security].SECRET_KEY`, `[security].INTERNAL_TOKEN`, and
+  `[oauth2].JWT_SECRET` are all present in the source `app.ini`
+- Source Redis DB number differs from target's (if both use Redis)
+
+**Do not skip this step.** If `SECRET_KEY` is empty on source, 2FA / OAuth
+apps / encrypted secrets all turn into unrecoverable garbage after the
+migration and this is the last chance to notice.
+
+### 5. Freeze source and run `dump`
+
+```sh
+# Put source Gitea in offline/read-only mode, or stop the service outright.
+ssh gitea.example.com 'sudo systemctl stop gitea'
+
+gitea2forgejo dump --config config.yaml
+```
+
+`dump` runs 5 stages and writes everything into `work_dir`:
+
+| Stage         | Output                                          |
+|---------------|-------------------------------------------------|
+| API harvest   | `source-manifest.json` (full entity inventory)  |
+| login_source  | merged into the same manifest                   |
+| `gitea dump`  | `gitea-dump.tar.zst` (app.ini + data/repos/custom + xorm SQL) |
+| native DB     | `gitea.dump` (pg_dump -Fc) or `gitea.sql` (mysqldump) or `gitea.sqlite` |
+| S3 mirror     | `s3/` with attachments, lfs, packages, avatars  |
+
+Individual stages can be skipped via `options.skip_gitea_dump`,
+`options.skip_native_db`, `options.skip_s3_mirror` in the config — useful
+when rehearsing against staging.
+
+A full production-size dump typically runs **30 min to 6 hours** depending
+on repo + LFS volume. The biggest factor is the `gitea dump` tarball
+transfer over SSH; run the tool on a host with fast network to the source.
+
+### 6. Install Forgejo v15 on the target host
+
+Fresh install, empty DB. **Do not run the initial setup wizard** — the
+DB must be empty for `restore` to import into. Leave the Forgejo service
+stopped.
+
+### 7. Run `restore`
+
+```sh
+gitea2forgejo restore --config config.yaml
+```
+
+11 steps (all logged):
+
+1. SSH to target, `systemctl stop forgejo`
+2. Extract `gitea-dump.tar.zst` into `work_dir/extracted/`
+3. `rsync` `data/`, `repos/`, `custom/` to the target host
+4. Translate source `app.ini` → target `app.ini` (preserve `SECRET_KEY`,
+   rewrite hostname and data paths, set `COOKIE_REMEMBER_NAME`,
+   set `[actions].DEFAULT_ACTIONS_URL`)
+5. `pg_restore` (or `mysql < dump.sql`, or copy sqlite file) into target DB
+6. `UPDATE version SET version = 305` ([forgejo#7638](https://codeberg.org/forgejo/forgejo/issues/7638) schema trick)
+7. Remove stale Bleve indexer files
+8. `chown -R forgejo:forgejo` data/repos/custom
+9. Start Forgejo — runs forward DB migrations on boot (watch for errors)
+10. `forgejo doctor check --all --fix --log-file …` on the target
+11. `forgejo admin regenerate hooks`
+
+### 8. Post-migration (manual, for now)
+
+Until `supplement` and `verify` ship, work through
+[`docs/post-migration-checklist.md`](docs/post-migration-checklist.md).
+The items that always need operator action:
+
+- Re-register Actions runners (their tokens are hostname-scoped)
+- Announce "please re-login + re-enroll 2FA if lost + regenerate PATs" to users
+- Update DNS / reverse-proxy / external CI that points at the old hostname
+- Spot-check a 2FA login, a webhook firing, a workflow using a secret,
+  an LFS clone, and a package pull
+
+### End-to-end worked example
+
+```sh
+# one-time prep
+ssh-keyscan -H gitea.example.com forgejo.example.com >> ~/.ssh/known_hosts
+export GITEA_ADMIN_TOKEN=...  FORGEJO_ADMIN_TOKEN=...
+export GITEA_DB_DSN=...       FORGEJO_DB_DSN=...
+cp example.config.yaml config.yaml && $EDITOR config.yaml
+
+# 5 min
+gitea2forgejo preflight --config config.yaml
+# Inspect work_dir/preflight-report.md — must be GO
+
+# cutover window begins
+ssh gitea.example.com 'sudo systemctl stop gitea'
+
+# 30 min – 6 hr depending on repo/LFS volume
+gitea2forgejo dump --config config.yaml
+
+# 30 min – 2 hr
+gitea2forgejo restore --config config.yaml
+
+# Forgejo now live at target URL — smoke-test, then cut DNS
+```
+
+### Logs, artifacts, debugging
+
+- Everything the tool produces lands in `work_dir`: dump tarball, native DB
+  dump, S3 mirror, `source-manifest.json`, `preflight-report.md`,
+  translated `target-app.ini`, and (after restore) the remote doctor log.
+- Increase verbosity with `--log-level debug`.
+- Each subcommand is idempotent for the stages that precede it: rerunning
+  `dump` will re-harvest the API and re-fetch the tarball (overwriting the
+  previous one); rerunning `restore` will re-extract and re-rsync. This is
+  useful when the prior run failed partway through.
+
+### Rehearsing against staging
+
+The migration is *not* rollback-safe once `restore` starts writing. Always
+rehearse first against disposable copies:
+
+1. Restore the source's DB dump into a disposable Postgres.
+2. Boot a disposable Gitea pointed at that DB on a VM.
+3. Boot a fresh Forgejo v15 on a second VM.
+4. Run the full `preflight` → `dump` → `restore` flow against the disposable pair.
+5. Exercise the golden paths (2FA login, webhook fire, Actions run with a
+   secret, LFS clone, package pull).
+6. Only then repeat against production.
 
 ## Requirements
 
