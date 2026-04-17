@@ -316,21 +316,44 @@ func checkSecretKey(r *Result, ssh *remote.Client, cfg *config.Config, log *slog
 		}
 	}
 	if len(missing) > 0 {
-		status := "FAIL"
-		suffix := " — without these, 2FA / OAuth2 apps / Actions secrets / " +
-			"push-mirror credentials will not survive migration. " +
-			"If you don't use those features, set options.accept_missing_secret_key: true " +
-			"in config.yaml to downgrade this to a warning"
-		if cfg.Options.AcceptMissingSecretKey {
-			status = "WARN"
-			suffix = " — options.accept_missing_secret_key is true; proceeding. " +
-				"Any 2FA enrollments, OAuth2 app client secrets, encrypted Actions " +
-				"secrets, and stored push-mirror credentials will be unrecoverable " +
-				"on the target"
+		// Replace hand-wavy "will be lost" with real counts from the DB.
+		detail := "missing/empty in app.ini, container env, and _URI lookups: " +
+			strings.Join(missing, ", ")
+		impact, ierr := countSecretKeyImpact(ssh, cfg)
+		if ierr != nil {
+			log.Warn("could not compute secret-key impact", "err", ierr)
 		}
-		r.add(Check{Name: "source: secret keys", Status: status,
-			Detail: "missing/empty in app.ini, container env, and _URI lookups: " +
-				strings.Join(missing, ", ") + suffix})
+
+		status := "FAIL"
+		switch {
+		case impact != nil && impact.Lossless() && cfg.Options.AcceptMissingSecretKey:
+			status = "PASS"
+			detail += ". No data depends on SECRET_KEY: " + impact.Summary() +
+				". options.accept_missing_secret_key is true — safe to proceed."
+		case impact != nil && impact.Lossless():
+			// Nothing actually at stake, but operator hasn't acknowledged.
+			status = "WARN"
+			detail += ". No data depends on SECRET_KEY: " + impact.Summary() +
+				". Set options.accept_missing_secret_key: true to proceed."
+		case cfg.Options.AcceptMissingSecretKey:
+			status = "WARN"
+			detail += ". Impact: "
+			if impact != nil {
+				detail += impact.Summary()
+			} else {
+				detail += "2FA/OAuth/Actions-secrets/push-mirror credentials will be unrecoverable on target"
+			}
+			detail += ". options.accept_missing_secret_key is true — proceeding"
+		default:
+			detail += ". Impact: "
+			if impact != nil {
+				detail += impact.Summary()
+			} else {
+				detail += "2FA/OAuth/Actions-secrets/push-mirror credentials will be unrecoverable on target"
+			}
+			detail += ". Set options.accept_missing_secret_key: true in config.yaml to proceed"
+		}
+		r.add(Check{Name: "source: secret keys", Status: status, Detail: detail})
 		return
 	}
 	r.add(Check{Name: "source: secret keys", Status: "PASS",
