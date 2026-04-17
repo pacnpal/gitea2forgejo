@@ -13,7 +13,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"syscall"
 
 	"github.com/pacnpal/gitea2forgejo/internal/client"
 	"github.com/pacnpal/gitea2forgejo/internal/config"
@@ -501,24 +500,16 @@ func checkDisk(r *Result, src *remote.Client, srcData, workDir string, log *slog
 }
 
 // localDiskFreeBytes returns free bytes on the filesystem holding path.
-// Walks up to a parent if path doesn't exist yet (common: work_dir hasn't
-// been created before the first dump).
+// Walks up to a parent when path doesn't exist yet (common: work_dir
+// hasn't been created before the first dump). The actual statfs call
+// is implemented per-platform in disk_unix.go / disk_windows.go.
 func localDiskFreeBytes(path string) (uint64, error) {
 	for p := path; p != "" && p != "."; p = filepath.Dir(p) {
 		if _, err := os.Stat(p); err == nil {
-			var st syscall.Statfs_t
-			if err := syscall.Statfs(p, &st); err != nil {
-				return 0, err
-			}
-			return uint64(st.Bavail) * uint64(st.Bsize), nil
+			return diskFree(p)
 		}
 	}
-	// Fallback: stat CWD.
-	var st syscall.Statfs_t
-	if err := syscall.Statfs(".", &st); err != nil {
-		return 0, err
-	}
-	return uint64(st.Bavail) * uint64(st.Bsize), nil
+	return diskFree(".")
 }
 
 // parseINI returns a flat map keyed by "section.key". Minimal: we only need
