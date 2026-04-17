@@ -1,0 +1,14 @@
+version: 1
+env:
+  - GO111MODULE=on
+  - CGO_ENABLED=0
+flags:
+  - -trimpath
+goos: linux
+goarch: amd64
+ldflags:
+  - "-s -w"
+  - "-X main.version={{ .Env.VERSION }}"
+  - "-X main.commit={{ .Env.COMMIT }}"
+main: ./cmd/gitea2forgejo
+binary: gitea2forgejo-linux-amd64

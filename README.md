@@ -20,18 +20,34 @@ this tool handles and what requires manual operator action.
 
 ### Pre-built release binary (recommended)
 
-Each release attaches a static linux/amd64 binary built and signed by the
+Each release attaches static binaries for 6 platforms — `linux`, `darwin`,
+and `windows` on both `amd64` and `arm64` — built and signed by the
 [SLSA3 Go builder](https://github.com/slsa-framework/slsa-github-generator)
-along with an `.intoto.jsonl` provenance attestation.
+along with one `.intoto.jsonl` provenance attestation per binary.
 
 ```sh
 VERSION=v0.1.0
+# Pick one. Windows binaries have a .exe suffix.
+PLATFORM=linux-amd64        # linux-amd64 | linux-arm64 | darwin-amd64 |
+                            # darwin-arm64 | windows-amd64.exe | windows-arm64.exe
+
 curl -L -o gitea2forgejo \
-  https://github.com/pacnpal/gitea2forgejo/releases/download/$VERSION/gitea2forgejo-linux-amd64
+  https://github.com/pacnpal/gitea2forgejo/releases/download/$VERSION/gitea2forgejo-$PLATFORM
 chmod +x gitea2forgejo
 sudo mv gitea2forgejo /usr/local/bin/
 gitea2forgejo --version
 ```
+
+**Platform notes:**
+
+- **Linux**: primary target. All external commands (`rsync`, `pg_dump`, `tar`,
+  `mc`, `skopeo`) are in distro package repos.
+- **macOS**: works fully; install `rsync`, `postgresql` (for `pg_dump`),
+  `zstd`, `mc` and `skopeo` via Homebrew.
+- **Windows**: native binaries build and the API-only flows (`preflight`,
+  manifest harvest, API supplement) work, but the dump/restore stages shell
+  out to rsync/pg_dump/tar-with-zstd. Use from WSL2 or Git Bash with MSYS2
+  packages installed; native PowerShell is not supported.
 
 Verify the provenance before running (optional but recommended):
 
@@ -39,18 +55,19 @@ Verify the provenance before running (optional but recommended):
 # Install once.
 go install github.com/slsa-framework/slsa-verifier/v2/cli/slsa-verifier@latest
 
-# Fetch binary + provenance, then verify.
+# Fetch binary + its provenance, then verify.
 VERSION=v0.1.0
-curl -L -o gitea2forgejo-linux-amd64 \
-  https://github.com/pacnpal/gitea2forgejo/releases/download/$VERSION/gitea2forgejo-linux-amd64
-curl -L -o gitea2forgejo-linux-amd64.intoto.jsonl \
-  https://github.com/pacnpal/gitea2forgejo/releases/download/$VERSION/gitea2forgejo-linux-amd64.intoto.jsonl
+PLATFORM=linux-amd64
+curl -L -o gitea2forgejo-$PLATFORM \
+  https://github.com/pacnpal/gitea2forgejo/releases/download/$VERSION/gitea2forgejo-$PLATFORM
+curl -L -o gitea2forgejo-$PLATFORM.intoto.jsonl \
+  https://github.com/pacnpal/gitea2forgejo/releases/download/$VERSION/gitea2forgejo-$PLATFORM.intoto.jsonl
 
 slsa-verifier verify-artifact \
-  --provenance-path gitea2forgejo-linux-amd64.intoto.jsonl \
+  --provenance-path gitea2forgejo-$PLATFORM.intoto.jsonl \
   --source-uri github.com/pacnpal/gitea2forgejo \
   --source-tag $VERSION \
-  gitea2forgejo-linux-amd64
+  gitea2forgejo-$PLATFORM
 ```
 
 ### `go install`

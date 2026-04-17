@@ -1,4 +1,4 @@
-# SLSA3-compliant Go release workflow.
+# SLSA3-compliant Go release workflow for 6 target platforms.
 # Produces signed provenance attestations verifiable via slsa-verifier.
 # See https://slsa.dev and https://github.com/slsa-framework/slsa-github-generator.
 
@@ -12,6 +12,17 @@ permissions: read-all
 
 jobs:
   build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: linux,   arch: amd64 }
+          - { os: linux,   arch: arm64 }
+          - { os: darwin,  arch: amd64 }
+          - { os: darwin,  arch: arm64 }
+          - { os: windows, arch: amd64 }
+          - { os: windows, arch: arm64 }
+    name: build (${{ matrix.os }}/${{ matrix.arch }})
     permissions:
       id-token: write # To sign provenance.
       contents: write # To upload release assets.
@@ -19,11 +30,8 @@ jobs:
     uses: slsa-framework/slsa-github-generator/.github/workflows/builder_go_slsa3.yml@v2.1.0
     with:
       go-version: "1.26"
-      config-file: .slsa-goreleaser.yml
-      # Upload the built binary + its provenance to the triggering release.
+      config-file: .slsa-goreleaser-${{ matrix.os }}-${{ matrix.arch }}.yml
       upload-assets: true
-      # GITHUB_SHA / GITHUB_REF_NAME aren't available to the builder's
-      # template evaluator by default — pass them explicitly as trusted,
-      # evaluated environment inputs so the config can reference them
-      # as {{ .Env.VERSION }} and {{ .Env.COMMIT }}.
+      # Pass VERSION + COMMIT as trusted, evaluated env vars so the config's
+      # ldflags can reference them as {{ .Env.VERSION }} / {{ .Env.COMMIT }}.
       evaluated-envs: "VERSION:${{ github.ref_name }}, COMMIT:${{ github.sha }}"
