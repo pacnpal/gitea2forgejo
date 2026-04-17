@@ -229,10 +229,12 @@ func checkDBSQLite(r *Result, label string, d config.DB, ssh *remote.Client) {
 			Detail: "sqlite3 DSN is empty"})
 		return
 	}
-	out, err := ssh.Run(fmt.Sprintf("test -f %s && head -c 15 %s", shQuote(path), shQuote(path)))
+	// Use `file` command — it's binary-safe, doesn't race with live
+	// SQLite writers (unlike `head -c 15` which can truncate mid-page),
+	// and works regardless of the SQLite version on the host.
+	out, err := ssh.Run(fmt.Sprintf("test -f %s && file -b %s", shQuote(path), shQuote(path)))
 	if err != nil {
 		// For target, the file may not exist yet (fresh Forgejo install).
-		// Surface it as a WARN rather than FAIL.
 		status := "WARN"
 		if label == "source" {
 			status = "FAIL"
@@ -241,9 +243,10 @@ func checkDBSQLite(r *Result, label string, d config.DB, ssh *remote.Client) {
 			Detail: fmt.Sprintf("%s: %v", path, err)})
 		return
 	}
-	if !strings.HasPrefix(string(out), "SQLite format 3") {
+	desc := strings.TrimSpace(string(out))
+	if !strings.Contains(desc, "SQLite") {
 		r.add(Check{Name: label + ": db", Status: "FAIL",
-			Detail: fmt.Sprintf("%s exists but isn't a SQLite database", path)})
+			Detail: fmt.Sprintf("%s exists but `file` reports: %s", path, desc)})
 		return
 	}
 	r.add(Check{Name: label + ": db", Status: "PASS",

@@ -66,69 +66,77 @@ func (i *SecretKeyImpact) Lossless() bool {
 		i.LDAPSources == 0
 }
 
-// countSecretKeyImpact runs a single query over the source DB to classify
-// every piece of data that would be affected by a missing SECRET_KEY.
-// Currently supports SQLite only (the most common case for Docker
-// deployments). For Postgres/MySQL we return nil — operator gets the
-// generic warning, no real regression.
+// countSecretKeyImpact classifies rows in the source DB that depend on
+// SECRET_KEY. Queries are run one-at-a-time and individual failures
+// (missing table on an unusual schema) are swallowed — we want a best-
+// effort count, not an all-or-nothing.
 //
-// OAuth2 apps with empty client_secret AND owner-user 0 are Gitea's
-// built-in system apps (`tea` CLI, Git Credential Manager,
-// git-credential-oauth) — PKCE public clients that need no secret.
-// They migrate fine and Forgejo ships the same IDs, so we classify
-// them as safe rather than dead.
+// Currently supports SQLite only; Postgres/MySQL fall back to generic
+// messaging in the caller.
+//
+// OAuth2 apps with uid=0 are Gitea's built-in system apps
+// (tea / Git Credential Manager / git-credential-oauth) — PKCE public
+// clients that need no secret. Classified as safe, not dead.
 func countSecretKeyImpact(ssh *remote.Client, cfg *config.Config) (*SecretKeyImpact, error) {
 	if cfg.Source.DB.Dialect != "sqlite3" {
 		return nil, nil
 	}
-	// Each row tolerates a missing table (via sqlite_master existence
-	// check) so we don't break when a very old or very new schema omits
-	// one of these. For unavailable tables, we silently count 0.
-	query := `
-SELECT 'totp', COUNT(*) FROM two_factor;
-SELECT 'oauth2_active', COUNT(*) FROM oauth2_application WHERE length(client_secret) > 0;
-SELECT 'oauth2_dead_user', COUNT(*) FROM oauth2_application WHERE length(client_secret) = 0 AND uid > 0;
-SELECT 'oauth2_builtin',   COUNT(*) FROM oauth2_application WHERE length(client_secret) = 0 AND uid = 0;
-SELECT 'push_mirror', COUNT(*) FROM push_mirror;
-SELECT 'actions_secrets', COUNT(*) FROM (
-  SELECT 1 FROM sqlite_master WHERE type='table' AND name='secret' LIMIT 0
-  UNION ALL SELECT 1 FROM secret
-) ;
-SELECT 'ldap_sources', COUNT(*) FROM login_source WHERE type IN (2, 5);
-SELECT 'webauthn', COUNT(*) FROM webauthn_credential;`
-
-	out, err := runSqlite(ssh, cfg, query)
-	if err != nil {
-		return nil, err
-	}
 	impact := &SecretKeyImpact{}
-	for _, line := range strings.Split(string(out), "\n") {
-		line = strings.TrimSpace(line)
-		parts := strings.SplitN(line, "|", 2)
-		if len(parts) != 2 {
-			continue
+	targets := []struct {
+		query string
+		into  *int
+	}{
+		{"SELECT COUNT(*) FROM two_factor", &impact.TOTP},
+		{"SELECT COUNT(*) FROM oauth2_application WHERE length(client_secret) > 0", &impact.OAuth2Active},
+		{"SELECT COUNT(*) FROM oauth2_application WHERE length(client_secret) = 0 AND uid > 0", &impact.OAuth2DeadUser},
+		{"SELECT COUNT(*) FROM oauth2_application WHERE length(client_secret) = 0 AND uid = 0", &impact.OAuth2BuiltIn},
+		{"SELECT COUNT(*) FROM push_mirror", &impact.PushMirrors},
+		{"SELECT COUNT(*) FROM secret", &impact.ActionsSecrets},
+		{"SELECT COUNT(*) FROM login_source WHERE type IN (2, 5)", &impact.LDAPSources},
+		{"SELECT COUNT(*) FROM webauthn_credential", &impact.Webauthn},
+	}
+	any := false
+	for _, t := range targets {
+		n, err := runSqliteCount(ssh, cfg, t.query)
+		if err != nil {
+			continue // missing table or other per-query error — leave count at 0
 		}
-		n, _ := strconv.Atoi(parts[1])
-		switch parts[0] {
-		case "totp":
-			impact.TOTP = n
-		case "oauth2_active":
-			impact.OAuth2Active = n
-		case "oauth2_dead_user":
-			impact.OAuth2DeadUser = n
-		case "oauth2_builtin":
-			impact.OAuth2BuiltIn = n
-		case "push_mirror":
-			impact.PushMirrors = n
-		case "actions_secrets":
-			impact.ActionsSecrets = n
-		case "ldap_sources":
-			impact.LDAPSources = n
-		case "webauthn":
-			impact.Webauthn = n
-		}
+		any = true
+		*t.into = n
+	}
+	if !any {
+		return nil, fmt.Errorf("could not query sqlite DB (host sqlite3 + common container paths both failed)")
 	}
 	return impact, nil
+}
+
+// runSqliteCount runs a single COUNT(*) query and returns the integer.
+// Uses the same host-sqlite3-then-docker-exec fallback as runSqlite.
+func runSqliteCount(ssh *remote.Client, cfg *config.Config, query string) (int, error) {
+	out, err := runSqlite(ssh, cfg, query)
+	if err != nil {
+		return 0, err
+	}
+	// SQLite prints a single column/row here, e.g. "42" with newline.
+	s := strings.TrimSpace(string(out))
+	if s == "" {
+		return 0, fmt.Errorf("empty response")
+	}
+	// Some sqlite builds print headers when they feel like it; take
+	// the LAST non-empty line to be robust.
+	lines := strings.Split(s, "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		line := strings.TrimSpace(lines[i])
+		if line == "" {
+			continue
+		}
+		n, err := strconv.Atoi(line)
+		if err != nil {
+			return 0, fmt.Errorf("parse %q: %w", line, err)
+		}
+		return n, nil
+	}
+	return 0, fmt.Errorf("no parseable line in output")
 }
 
 // runSqlite executes a query against the source SQLite DB. Tries the host
