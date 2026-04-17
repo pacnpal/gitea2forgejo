@@ -14,6 +14,7 @@ import (
 
 	"github.com/pkg/sftp"
 	"golang.org/x/crypto/ssh"
+	"golang.org/x/crypto/ssh/agent"
 	"golang.org/x/crypto/ssh/knownhosts"
 
 	"github.com/pacnpal/gitea2forgejo/internal/config"
@@ -40,13 +41,9 @@ func Dial(c *config.SSH) (*Client, error) {
 	if c == nil {
 		return nil, fmt.Errorf("ssh block is nil")
 	}
-	key, err := os.ReadFile(c.Key)
+	auth, err := buildAuth(c)
 	if err != nil {
-		return nil, fmt.Errorf("read key %s: %w", c.Key, err)
-	}
-	signer, err := ssh.ParsePrivateKey(key)
-	if err != nil {
-		return nil, fmt.Errorf("parse key: %w", err)
+		return nil, err
 	}
 	hkCallback, err := hostKeyCallback(c)
 	if err != nil {
@@ -54,7 +51,7 @@ func Dial(c *config.SSH) (*Client, error) {
 	}
 	cfg := &ssh.ClientConfig{
 		User:            c.User,
-		Auth:            []ssh.AuthMethod{ssh.PublicKeys(signer)},
+		Auth:            auth,
 		HostKeyCallback: hkCallback,
 		Timeout:         15 * time.Second,
 	}
@@ -69,6 +66,55 @@ func Dial(c *config.SSH) (*Client, error) {
 		return nil, fmt.Errorf("sftp new: %w", err)
 	}
 	return &Client{ssh: sshClient, sftp: sftpClient, addr: addr}, nil
+}
+
+// buildAuth returns the ssh.AuthMethods to try, in order:
+//
+//  1. If c.Key is set and readable, the key file.
+//  2. If SSH_AUTH_SOCK is exported, an ssh-agent backed method.
+//
+// At least one must succeed; otherwise the connection will never authenticate
+// and we'd rather fail early with a clear error.
+func buildAuth(c *config.SSH) ([]ssh.AuthMethod, error) {
+	var methods []ssh.AuthMethod
+	var probeErrs []string
+
+	// Key file (if specified and present).
+	if c.Key != "" {
+		data, err := os.ReadFile(c.Key)
+		switch {
+		case err == nil:
+			signer, err := ssh.ParsePrivateKey(data)
+			if err != nil {
+				return nil, fmt.Errorf("parse key %s: %w (is it password-protected? agent-forward it instead)", c.Key, err)
+			}
+			methods = append(methods, ssh.PublicKeys(signer))
+		case os.IsNotExist(err):
+			probeErrs = append(probeErrs, c.Key+" not found")
+		default:
+			return nil, fmt.Errorf("read key %s: %w", c.Key, err)
+		}
+	}
+
+	// ssh-agent fallback.
+	if sock := os.Getenv("SSH_AUTH_SOCK"); sock != "" {
+		conn, err := net.Dial("unix", sock)
+		if err != nil {
+			probeErrs = append(probeErrs, "agent at SSH_AUTH_SOCK unreachable: "+err.Error())
+		} else {
+			methods = append(methods, ssh.PublicKeysCallback(agent.NewClient(conn).Signers))
+		}
+	} else {
+		probeErrs = append(probeErrs, "no SSH_AUTH_SOCK in environment")
+	}
+
+	if len(methods) == 0 {
+		return nil, fmt.Errorf(
+			"no usable SSH auth: %s. "+
+				"Set ssh.key to an existing private key OR start an ssh-agent with `ssh-add`",
+			strings.Join(probeErrs, "; "))
+	}
+	return methods, nil
 }
 
 // hostKeyCallback returns an ssh.HostKeyCallback that verifies the remote

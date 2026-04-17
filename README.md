@@ -317,6 +317,10 @@ If you want `gitea2forgejo` to figure out as much of `config.yaml` as it
 can on its own:
 
 ```sh
+# Interactive: just run it and answer the prompts.
+gitea2forgejo init
+
+# Or one-shot:
 export SOURCE_ADMIN_TOKEN=gta_...
 export TARGET_ADMIN_TOKEN=fjo_...
 
@@ -325,13 +329,18 @@ gitea2forgejo init \
   --source-ssh   root@gitea.example.com \
   --target-url   https://forgejo.example.com \
   --target-ssh   root@forgejo.example.com \
-  --ssh-key      ~/.ssh/gitea2forgejo \
   -o config.yaml
 ```
 
+If any required flags are missing, `init` prompts for them at the TTY
+(admin tokens are masked). Pass every flag to skip the prompts — useful
+for CI / scripted runs.
+
 `init` does:
 
-1. Opens an SSH connection to the source host.
+1. Opens an SSH connection to the source host. Without `--ssh-key`, it
+   tries `~/.ssh/id_ed25519`, `id_ecdsa`, `id_rsa`, then falls back to
+   an `ssh-agent` (via `$SSH_AUTH_SOCK`) if available.
 2. Runs `docker ps` to detect whether Gitea is in a container (and if so,
    `docker inspect` to resolve the bind-mounted `app.ini` path).
 3. Reads the source `app.ini` and extracts: `data_dir`, `repo_root`,

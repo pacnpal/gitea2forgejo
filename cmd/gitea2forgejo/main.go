@@ -100,14 +100,23 @@ Typical invocation:
 Then review config.yaml, fill in any env vars the generator flagged, and
 run 'gitea2forgejo preflight --config config.yaml'.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			var err error
-			opt.SourceSSHUser, opt.SourceSSHHost, opt.SourceSSHPort, err = parseSSHDest(sourceSSH)
-			if err != nil {
-				return fmt.Errorf("--source-ssh: %w", err)
+			if sourceSSH != "" {
+				var err error
+				opt.SourceSSHUser, opt.SourceSSHHost, opt.SourceSSHPort, err = parseSSHDest(sourceSSH)
+				if err != nil {
+					return fmt.Errorf("--source-ssh: %w", err)
+				}
 			}
-			opt.TargetSSHUser, opt.TargetSSHHost, opt.TargetSSHPort, err = parseSSHDest(targetSSH)
-			if err != nil {
-				return fmt.Errorf("--target-ssh: %w", err)
+			if targetSSH != "" {
+				var err error
+				opt.TargetSSHUser, opt.TargetSSHHost, opt.TargetSSHPort, err = parseSSHDest(targetSSH)
+				if err != nil {
+					return fmt.Errorf("--target-ssh: %w", err)
+				}
+			}
+			// Interactive fill-in for anything missing (no-op on non-TTY).
+			if err := initcmd.Interactive(opt); err != nil {
+				return err
 			}
 			return initcmd.Run(opt, log)
 		},
@@ -134,8 +143,9 @@ run 'gitea2forgejo preflight --config config.yaml'.`,
 
 	cmd.PreRunE = func(cmd *cobra.Command, args []string) error {
 		if sharedKey == "" {
-			home, _ := os.UserHomeDir()
-			sharedKey = filepath.Join(home, ".ssh", "id_ed25519")
+			sharedKey = firstExistingKey()
+			// If none found, leave empty so remote.Dial falls back to
+			// SSH_AUTH_SOCK (agent) — that's a common laptop setup.
 		}
 		if opt.SourceSSHKey == "" {
 			opt.SourceSSHKey = sharedKey
@@ -146,6 +156,22 @@ run 'gitea2forgejo preflight --config config.yaml'.`,
 		return nil
 	}
 	return cmd
+}
+
+// firstExistingKey walks the usual private-key filenames in ~/.ssh and
+// returns the first that exists. Empty string means "use the SSH agent."
+func firstExistingKey() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	for _, name := range []string{"id_ed25519", "id_ecdsa", "id_rsa", "id_dsa"} {
+		p := filepath.Join(home, ".ssh", name)
+		if fi, err := os.Stat(p); err == nil && !fi.IsDir() {
+			return p
+		}
+	}
+	return ""
 }
 
 // parseSSHDest accepts [user@]host[:port] and extracts the components.
