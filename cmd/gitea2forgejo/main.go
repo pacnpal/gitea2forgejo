@@ -223,6 +223,17 @@ func newPreflightCmd() *cobra.Command {
 			}
 			log.Info("preflight: starting", "source", cfg.Source.URL, "target", cfg.Target.URL)
 			result := preflight.Run(cfg, log)
+
+			// If we're at a TTY and detected fixable warnings, offer
+			// to update config.yaml interactively and re-run.
+			if preflight.OfferRemediationsFromResult(cfg, result, configPath, log) {
+				log.Info("preflight: remediation applied, re-running checks")
+				if cfg2, err := loadConfig(); err == nil {
+					cfg = cfg2
+				}
+				result = preflight.Run(cfg, log)
+			}
+
 			path, err := result.WriteReport(cfg.WorkDir)
 			if err != nil {
 				return fmt.Errorf("write report: %w", err)
