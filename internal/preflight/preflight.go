@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 
 	"github.com/pacnpal/gitea2forgejo/internal/client"
 	"github.com/pacnpal/gitea2forgejo/internal/config"
@@ -59,21 +60,24 @@ func Run(cfg *config.Config, log *slog.Logger) *Result {
 	defer closeSSH(srcSSH)
 	defer closeSSH(tgtSSH)
 
-	// DB reachability.
-	checkDB(r, "source", cfg.Source.DB, log)
-	checkDB(r, "target", cfg.Target.DB, log)
+	// DB reachability. SQLite is a file on the remote host, so we probe
+	// via SSH rather than attempting to sql.Open a remote path locally.
+	checkDB(r, "source", cfg.Source.DB, srcSSH, log)
+	checkDB(r, "target", cfg.Target.DB, tgtSSH, log)
 
 	// Target DB emptiness (setup-wizard detection).
 	checkTargetDBEmpty(r, cfg, log)
 
-	// SECRET_KEY presence on source (reads app.ini via SSH).
+	// SECRET_KEY presence on source (reads app.ini via SSH, overlays
+	// Docker env vars when source runs in a container).
 	if srcSSH != nil {
-		checkSecretKey(r, srcSSH, cfg.Source.ConfigFile, log)
+		checkSecretKey(r, srcSSH, cfg, log)
 	}
 
-	// Disk space on target work_dir vs source data_dir size.
-	if srcSSH != nil && tgtSSH != nil {
-		checkDisk(r, srcSSH, cfg.Source.DataDir, tgtSSH, cfg.WorkDir, log)
+	// Disk space: work_dir is LOCAL (on the mig-host). Compare its free
+	// space to the source data_dir size (read over SSH).
+	if srcSSH != nil {
+		checkDisk(r, srcSSH, cfg.Source.DataDir, cfg.WorkDir, log)
 	}
 
 	return r
@@ -191,7 +195,11 @@ func closeSSH(c *remote.Client) {
 	}
 }
 
-func checkDB(r *Result, label string, d config.DB, log *slog.Logger) {
+func checkDB(r *Result, label string, d config.DB, ssh *remote.Client, log *slog.Logger) {
+	if d.Dialect == "sqlite3" {
+		checkDBSQLite(r, label, d, ssh)
+		return
+	}
 	db, err := remote.OpenDB(d)
 	if err != nil {
 		r.add(Check{Name: label + ": db", Status: "FAIL", Detail: err.Error()})
@@ -201,7 +209,61 @@ func checkDB(r *Result, label string, d config.DB, log *slog.Logger) {
 	r.add(Check{Name: label + ": db", Status: "PASS", Detail: d.Dialect})
 }
 
+// checkDBSQLite verifies the sqlite file exists on the remote host and
+// starts with the SQLite magic bytes. We can't sql.Open the DSN here
+// because the file lives on the source/target host, not on the machine
+// running gitea2forgejo.
+func checkDBSQLite(r *Result, label string, d config.DB, ssh *remote.Client) {
+	if ssh == nil {
+		r.add(Check{Name: label + ": db", Status: "WARN",
+			Detail: "sqlite3; can't verify without ssh"})
+		return
+	}
+	path := d.DSN
+	// Strip any file: prefix or ?params.
+	if i := strings.Index(path, "?"); i >= 0 {
+		path = path[:i]
+	}
+	path = strings.TrimPrefix(path, "file:")
+	if path == "" {
+		r.add(Check{Name: label + ": db", Status: "FAIL",
+			Detail: "sqlite3 DSN is empty"})
+		return
+	}
+	out, err := ssh.Run(fmt.Sprintf("test -f %s && head -c 15 %s", shQuote(path), shQuote(path)))
+	if err != nil {
+		// For target, the file may not exist yet (fresh Forgejo install).
+		// Surface it as a WARN rather than FAIL.
+		status := "WARN"
+		if label == "source" {
+			status = "FAIL"
+		}
+		r.add(Check{Name: label + ": db", Status: status,
+			Detail: fmt.Sprintf("%s: %v", path, err)})
+		return
+	}
+	if !strings.HasPrefix(string(out), "SQLite format 3") {
+		r.add(Check{Name: label + ": db", Status: "FAIL",
+			Detail: fmt.Sprintf("%s exists but isn't a SQLite database", path)})
+		return
+	}
+	r.add(Check{Name: label + ": db", Status: "PASS",
+		Detail: "sqlite3 at " + path})
+}
+
+func shQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
 func checkTargetDBEmpty(r *Result, cfg *config.Config, log *slog.Logger) {
+	// SQLite target-empty check: if the DB file doesn't exist yet it's
+	// trivially empty. Skip the InspectTargetDB call that would try to
+	// sql.Open a remote path locally.
+	if cfg.Target.DB.Dialect == "sqlite3" {
+		r.add(Check{Name: "target: db empty", Status: "PASS",
+			Detail: "sqlite3 — target emptiness verified at restore time"})
+		return
+	}
 	state, err := restore.InspectTargetDB(cfg)
 	if err != nil {
 		r.add(Check{Name: "target: db empty", Status: "WARN", Detail: err.Error()})
@@ -223,13 +285,21 @@ func checkTargetDBEmpty(r *Result, cfg *config.Config, log *slog.Logger) {
 			"Set options.reset_target_db: true OR drop the database manually"})
 }
 
-func checkSecretKey(r *Result, ssh *remote.Client, configFile string, log *slog.Logger) {
-	data, err := ssh.ReadFile(configFile)
+func checkSecretKey(r *Result, ssh *remote.Client, cfg *config.Config, log *slog.Logger) {
+	data, err := ssh.ReadFile(cfg.Source.ConfigFile)
 	if err != nil {
 		r.add(Check{Name: "source: app.ini readable", Status: "FAIL", Detail: err.Error()})
 		return
 	}
 	keys := parseINI(data)
+
+	// Dockerized Gitea/Forgejo commonly pass SECRET_KEY via env vars in
+	// the form GITEA__security__SECRET_KEY=... (or FORGEJO__...). Those
+	// override app.ini, so read the container's env and layer them on top.
+	if cfg.Source.Docker != nil && cfg.Source.Docker.Container != "" {
+		overlayContainerEnv(ssh, cfg.Source.Docker.Container, keys, log)
+	}
+
 	missing := []string{}
 	for _, k := range []struct{ section, key string }{
 		{"security", "SECRET_KEY"},
@@ -243,7 +313,7 @@ func checkSecretKey(r *Result, ssh *remote.Client, configFile string, log *slog.
 	if len(missing) > 0 {
 		r.add(Check{Name: "source: secret keys",
 			Status: "FAIL",
-			Detail: "missing/empty in app.ini: " + strings.Join(missing, ", ") +
+			Detail: "missing/empty in app.ini (and container env): " + strings.Join(missing, ", ") +
 				" — without these, 2FA/OAuth/encrypted-secret values will not survive migration"})
 		return
 	}
@@ -251,7 +321,54 @@ func checkSecretKey(r *Result, ssh *remote.Client, configFile string, log *slog.
 		Detail: "SECRET_KEY, INTERNAL_TOKEN, JWT_SECRET present"})
 }
 
-func checkDisk(r *Result, src *remote.Client, srcData string, tgt *remote.Client, workDir string, log *slog.Logger) {
+// overlayContainerEnv reads environment variables off the container and
+// translates GITEA__section__KEY / FORGEJO__section__KEY into keys map
+// entries, overriding any app.ini values.
+func overlayContainerEnv(ssh *remote.Client, container string, keys map[string]string, log *slog.Logger) {
+	cmd := fmt.Sprintf(
+		"docker inspect --format '{{range .Config.Env}}{{.}}\\n{{end}}' %s 2>/dev/null || true",
+		shQuote(container),
+	)
+	out, err := ssh.Run(cmd)
+	if err != nil {
+		log.Warn("overlay container env: docker inspect failed", "err", err)
+		return
+	}
+	added := 0
+	for _, line := range strings.Split(string(out), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		eq := strings.Index(line, "=")
+		if eq < 0 {
+			continue
+		}
+		name, val := line[:eq], line[eq+1:]
+		var prefix string
+		switch {
+		case strings.HasPrefix(name, "GITEA__"):
+			prefix = "GITEA__"
+		case strings.HasPrefix(name, "FORGEJO__"):
+			prefix = "FORGEJO__"
+		default:
+			continue
+		}
+		body := strings.TrimPrefix(name, prefix)
+		sub := strings.SplitN(body, "__", 2)
+		if len(sub) != 2 {
+			continue
+		}
+		k := strings.ToLower(sub[0]) + "." + strings.ToUpper(sub[1])
+		keys[k] = val
+		added++
+	}
+	if added > 0 {
+		log.Info("overlay: merged container env vars", "count", added, "container", container)
+	}
+}
+
+func checkDisk(r *Result, src *remote.Client, srcData, workDir string, log *slog.Logger) {
 	size, err := src.DirSizeBytes(srcData)
 	if err != nil {
 		r.add(Check{Name: "source: data_dir size", Status: "WARN", Detail: err.Error()})
@@ -259,23 +376,42 @@ func checkDisk(r *Result, src *remote.Client, srcData string, tgt *remote.Client
 	}
 	r.add(Check{Name: "source: data_dir size", Status: "PASS", Detail: humanBytes(size)})
 
-	free, err := tgt.DiskFreeBytes(workDir)
+	// work_dir is on the mig-host (the machine running gitea2forgejo).
+	free, err := localDiskFreeBytes(workDir)
 	if err != nil {
-		// Maybe work_dir doesn't exist yet; try the parent.
-		if free2, err2 := tgt.DiskFreeBytes(filepath.Dir(workDir)); err2 == nil {
-			free = free2
-		} else {
-			r.add(Check{Name: "target: work_dir free", Status: "WARN", Detail: err.Error()})
-			return
-		}
+		r.add(Check{Name: "mig-host: work_dir free", Status: "WARN", Detail: err.Error()})
+		return
 	}
 	need := size * 2
 	if free < need {
-		r.add(Check{Name: "target: work_dir free", Status: "FAIL",
-			Detail: fmt.Sprintf("have %s, need ≥ 2× source data_dir = %s", humanBytes(free), humanBytes(need))})
+		r.add(Check{Name: "mig-host: work_dir free", Status: "FAIL",
+			Detail: fmt.Sprintf("have %s at %s, need ≥ 2× source data_dir = %s",
+				humanBytes(free), workDir, humanBytes(need))})
 		return
 	}
-	r.add(Check{Name: "target: work_dir free", Status: "PASS", Detail: humanBytes(free)})
+	r.add(Check{Name: "mig-host: work_dir free", Status: "PASS",
+		Detail: humanBytes(free) + " at " + workDir})
+}
+
+// localDiskFreeBytes returns free bytes on the filesystem holding path.
+// Walks up to a parent if path doesn't exist yet (common: work_dir hasn't
+// been created before the first dump).
+func localDiskFreeBytes(path string) (uint64, error) {
+	for p := path; p != "" && p != "."; p = filepath.Dir(p) {
+		if _, err := os.Stat(p); err == nil {
+			var st syscall.Statfs_t
+			if err := syscall.Statfs(p, &st); err != nil {
+				return 0, err
+			}
+			return uint64(st.Bavail) * uint64(st.Bsize), nil
+		}
+	}
+	// Fallback: stat CWD.
+	var st syscall.Statfs_t
+	if err := syscall.Statfs(".", &st); err != nil {
+		return 0, err
+	}
+	return uint64(st.Bavail) * uint64(st.Bsize), nil
 }
 
 // parseINI returns a flat map keyed by "section.key". Minimal: we only need
