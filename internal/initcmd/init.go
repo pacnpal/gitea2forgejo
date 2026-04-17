@@ -90,12 +90,23 @@ func Run(opt *Options, log *slog.Logger) error {
 // failure in a TTY it drives the ssh-keygen / ssh-keyscan / ssh-copy-id
 // flow in EnsureAuth. Side-effect: updates opt.<Label>SSHKey if a new key
 // was generated.
+//
+// When called for the target and target's SSHKey is empty, it inherits the
+// source's (already-bootstrapped) key as a starting point. That means when
+// source and target are the same host (or the source's key was already
+// copy-id'd to the target), the target's first Dial succeeds and we skip
+// a redundant keygen/keyscan/copy-id round-trip.
 func ensureSSHOrBootstrap(label string, opt *Options, log *slog.Logger) error {
 	var sshCfg *config.SSH
-	if label == "source" {
+	switch label {
+	case "source":
 		sshCfg = ProposeSSHConfig(opt.SourceSSHHost, opt.SourceSSHPort, opt.SourceSSHUser, opt.SourceSSHKey)
-	} else {
-		sshCfg = ProposeSSHConfig(opt.TargetSSHHost, opt.TargetSSHPort, opt.TargetSSHUser, opt.TargetSSHKey)
+	case "target":
+		key := opt.TargetSSHKey
+		if key == "" {
+			key = opt.SourceSSHKey // piggy-back on whatever source ended up using
+		}
+		sshCfg = ProposeSSHConfig(opt.TargetSSHHost, opt.TargetSSHPort, opt.TargetSSHUser, key)
 	}
 	if sshCfg == nil {
 		return fmt.Errorf("no SSH host configured")
