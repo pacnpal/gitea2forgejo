@@ -132,6 +132,17 @@ type Options struct {
 	// Gitea dump). DESTRUCTIVE — only set this after confirming the target
 	// holds nothing you want to keep.
 	ResetTargetDB bool `yaml:"reset_target_db"`
+
+	// AcceptMissingSecretKey downgrades the "missing SECRET_KEY" preflight
+	// check from FAIL to WARN. Only set this if you don't use 2FA, OAuth2
+	// apps, Actions secrets, or push-mirror credentials — those values are
+	// encrypted with SECRET_KEY and become unrecoverable without it.
+	//
+	// Gitea auto-generates a SECRET_KEY on first boot. Its absence almost
+	// always means the Gitea data volume isn't persisted (Docker without
+	// a mount), in which case the encrypted data is already being lost at
+	// every container restart.
+	AcceptMissingSecretKey bool `yaml:"accept_missing_secret_key"`
 }
 
 // Load reads and validates a config file.

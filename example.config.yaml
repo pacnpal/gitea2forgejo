@@ -132,3 +132,12 @@ options:
   # Forgejo-native tables that would collide with the Gitea dump.
   # Leave false if your target DB is genuinely empty.
   reset_target_db: false
+
+  # Downgrade the "missing SECRET_KEY" preflight check from FAIL to WARN.
+  # Only set this if you don't use 2FA / OAuth2 apps / Actions secrets /
+  # push-mirror credentials — those values are encrypted with SECRET_KEY
+  # and become unrecoverable without it. Gitea normally auto-generates a
+  # SECRET_KEY on first boot; its absence usually means the /data volume
+  # isn't persisted, in which case those features have been losing state
+  # at every restart anyway.
+  accept_missing_secret_key: false

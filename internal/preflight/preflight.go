@@ -300,6 +300,11 @@ func checkSecretKey(r *Result, ssh *remote.Client, cfg *config.Config, log *slog
 		overlayContainerEnv(ssh, cfg.Source.Docker.Container, keys, log)
 	}
 
+	// Gitea 1.25+ supports the _URI variants (SECRET_KEY_URI etc.) which
+	// point at a file containing the value, rather than embedding it in
+	// app.ini. Resolve those before reporting missing.
+	resolveURIs(ssh, cfg, keys, log)
+
 	missing := []string{}
 	for _, k := range []struct{ section, key string }{
 		{"security", "SECRET_KEY"},
@@ -311,14 +316,87 @@ func checkSecretKey(r *Result, ssh *remote.Client, cfg *config.Config, log *slog
 		}
 	}
 	if len(missing) > 0 {
-		r.add(Check{Name: "source: secret keys",
-			Status: "FAIL",
-			Detail: "missing/empty in app.ini (and container env): " + strings.Join(missing, ", ") +
-				" — without these, 2FA/OAuth/encrypted-secret values will not survive migration"})
+		status := "FAIL"
+		suffix := " — without these, 2FA / OAuth2 apps / Actions secrets / " +
+			"push-mirror credentials will not survive migration. " +
+			"If you don't use those features, set options.accept_missing_secret_key: true " +
+			"in config.yaml to downgrade this to a warning"
+		if cfg.Options.AcceptMissingSecretKey {
+			status = "WARN"
+			suffix = " — options.accept_missing_secret_key is true; proceeding. " +
+				"Any 2FA enrollments, OAuth2 app client secrets, encrypted Actions " +
+				"secrets, and stored push-mirror credentials will be unrecoverable " +
+				"on the target"
+		}
+		r.add(Check{Name: "source: secret keys", Status: status,
+			Detail: "missing/empty in app.ini, container env, and _URI lookups: " +
+				strings.Join(missing, ", ") + suffix})
 		return
 	}
 	r.add(Check{Name: "source: secret keys", Status: "PASS",
 		Detail: "SECRET_KEY, INTERNAL_TOKEN, JWT_SECRET present"})
+}
+
+// resolveURIs checks each required secret. If its primary value is empty
+// but a corresponding _URI key points to a file, read the file (via docker
+// exec when containerized, else direct SSH read) and use its contents.
+func resolveURIs(ssh *remote.Client, cfg *config.Config, keys map[string]string, log *slog.Logger) {
+	for _, k := range []struct{ section, key string }{
+		{"security", "SECRET_KEY"},
+		{"security", "INTERNAL_TOKEN"},
+		{"oauth2", "JWT_SECRET"},
+	} {
+		flat := k.section + "." + k.key
+		if strings.TrimSpace(keys[flat]) != "" {
+			continue
+		}
+		uriKey := flat + "_URI"
+		uri := strings.TrimSpace(keys[uriKey])
+		if uri == "" {
+			continue
+		}
+		val, err := readURI(ssh, cfg, uri)
+		if err != nil {
+			log.Warn("resolve URI failed", "key", uriKey, "uri", uri, "err", err)
+			continue
+		}
+		if val != "" {
+			keys[flat] = val
+			log.Info("resolved secret via _URI", "key", flat, "uri", uri)
+		}
+	}
+}
+
+// readURI interprets a Gitea _URI reference (currently only "file:" scheme).
+// When source runs in Docker, the path is inside the container — use
+// `docker exec cat` instead of a direct SSH read.
+func readURI(ssh *remote.Client, cfg *config.Config, uri string) (string, error) {
+	switch {
+	case strings.HasPrefix(uri, "file://"):
+		uri = strings.TrimPrefix(uri, "file://")
+	case strings.HasPrefix(uri, "file:"):
+		uri = strings.TrimPrefix(uri, "file:")
+	default:
+		return "", fmt.Errorf("unsupported URI scheme in %q (only file: is supported)", uri)
+	}
+	path := strings.TrimSpace(uri)
+	if path == "" {
+		return "", fmt.Errorf("empty path")
+	}
+	if cfg.Source.Docker != nil && cfg.Source.Docker.Container != "" {
+		cmd := fmt.Sprintf("docker exec %s cat %s",
+			shQuote(cfg.Source.Docker.Container), shQuote(path))
+		out, err := ssh.Run(cmd)
+		if err != nil {
+			return "", fmt.Errorf("docker exec cat: %w", err)
+		}
+		return strings.TrimSpace(string(out)), nil
+	}
+	data, err := ssh.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(data)), nil
 }
 
 // overlayContainerEnv reads environment variables off the container and
@@ -382,11 +460,17 @@ func checkDisk(r *Result, src *remote.Client, srcData, workDir string, log *slog
 		r.add(Check{Name: "mig-host: work_dir free", Status: "WARN", Detail: err.Error()})
 		return
 	}
-	need := size * 2
+	// Peak local usage: tar.zst fetched (≈ 0.4-0.7× original) + extracted
+	// tree (1× original). 1.5× is a realistic upper bound for tar.zst;
+	// tar (uncompressed) would need ~2×.
+	mult := 1.5
+	need := uint64(float64(size) * mult)
 	if free < need {
 		r.add(Check{Name: "mig-host: work_dir free", Status: "FAIL",
-			Detail: fmt.Sprintf("have %s at %s, need ≥ 2× source data_dir = %s",
-				humanBytes(free), workDir, humanBytes(need))})
+			Detail: fmt.Sprintf("have %s at %s, need ≥ %.1f× source data_dir = %s. "+
+				"Point work_dir at a filesystem with more space (edit config.yaml's work_dir), "+
+				"or symlink ./work to a larger volume.",
+				humanBytes(free), workDir, mult, humanBytes(need))})
 		return
 	}
 	r.add(Check{Name: "mig-host: work_dir free", Status: "PASS",
