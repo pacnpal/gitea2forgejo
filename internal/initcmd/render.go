@@ -121,12 +121,44 @@ func populateInstance(
 		}
 	}
 	if container != "" {
-		inst.Docker = &config.Docker{
+		d := &config.Docker{
 			Container: container,
 			User:      "git", // gitea/forgejo default
 			Binary:    "docker",
 		}
+		// Copy the mounts the probe captured so they're visible in
+		// config.yaml and usable without re-running docker inspect.
+		if probe != nil {
+			for _, m := range probe.Mounts {
+				d.Mounts = append(d.Mounts, config.Mount{
+					Host:      m.HostPath,
+					Container: m.ContainerPath,
+				})
+			}
+		}
+		inst.Docker = d
+
+		// Set RemoteWorkDir to a host path under a bind mount so
+		// `gitea dump` can write there and SFTP can read it without
+		// any docker cp intermediate. Pick the longest-prefix mount
+		// that covers DataDir (if possible), else the first mount.
+		inst.RemoteWorkDir = chooseRemoteWorkDir(inst.DataDir, d)
 	}
+}
+
+// chooseRemoteWorkDir picks a HOST path for dump scratch space. It
+// prefers a subdirectory of data_dir (since that's guaranteed to be
+// bind-mounted and usually has ample space). Falls back to a subdir
+// of the first mount, else leaves the default /tmp path.
+func chooseRemoteWorkDir(dataDir string, d *config.Docker) string {
+	const subdir = "gitea2forgejo-work"
+	if dataDir != "" && d.HostToContainer(dataDir) != "" {
+		return dataDir + "/" + subdir
+	}
+	if len(d.Mounts) > 0 {
+		return d.Mounts[0].Host + "/" + subdir
+	}
+	return "/tmp/gitea2forgejo"
 }
 
 // writeYAML emits the config with a human-friendly leading comment. We

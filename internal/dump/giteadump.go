@@ -91,17 +91,28 @@ func giteaDumpBareMetal(cfg *config.Config, cli *remote.Client, log *slog.Logger
 // nowhere near enough for a multi-GB dump of a real instance. Instead we
 // prefer a SUBDIRECTORY UNDER A BIND-MOUNT so the dump lands on host-
 // backed disk with real capacity, and SFTP can read it directly from the
-// host side without any docker cp round-trip. Fallback to /tmp + docker
-// cp only when nothing is bind-mounted (vanishingly rare).
+// host side without any docker cp round-trip.
+//
+// Path translation uses the Mounts list captured in config.yaml by
+// `gitea2forgejo init`. If the list is empty (older config), we fall back
+// to runtime `docker inspect`.
 func giteaDumpDocker(cfg *config.Config, cli *remote.Client, log *slog.Logger) (string, error) {
 	d := cfg.Source.Docker
 	ext := cfg.Options.DumpFormat
 
-	mounts, err := inspectMounts(cli, d.Container)
-	if err != nil {
-		return "", fmt.Errorf("docker inspect mounts: %w", err)
+	// Ensure we have mounts. Prefer what config.yaml recorded (visible,
+	// auditable, user-editable); else re-query Docker so older configs
+	// still work without re-running init.
+	if len(d.Mounts) == 0 {
+		ms, err := inspectMounts(cli, d.Container)
+		if err != nil {
+			return "", fmt.Errorf("docker inspect mounts: %w", err)
+		}
+		for _, m := range ms {
+			d.Mounts = append(d.Mounts, config.Mount{Host: m[0], Container: m[1]})
+		}
 	}
-	containerConfig := hostToContainer(cfg.Source.ConfigFile, mounts)
+	containerConfig := d.HostToContainer(cfg.Source.ConfigFile)
 	if containerConfig == "" {
 		return "", fmt.Errorf(
 			"source.config_file (%s) is not under any bind mount of container %q — "+
@@ -109,10 +120,7 @@ func giteaDumpDocker(cfg *config.Config, cli *remote.Client, log *slog.Logger) (
 			cfg.Source.ConfigFile, d.Container)
 	}
 
-	// Preferred scratch: a subdir under data_dir (bind-mounted → host disk).
-	// Alt 1: under remote_work_dir if it's bind-mounted.
-	// Alt 2 (fallback): container /tmp + docker cp. Space-risky.
-	hostWork, containerWork, needsDockerCp := pickDockerScratch(cfg, mounts)
+	hostWork, containerWork, needsDockerCp := pickDockerScratch(cfg)
 
 	// mkdir (and chown if we have a user) inside the container.
 	mkdirInner := fmt.Sprintf("mkdir -p %s", shQuote(containerWork))
@@ -197,30 +205,28 @@ func giteaDumpDocker(cfg *config.Config, cli *remote.Client, log *slog.Logger) (
 }
 
 // pickDockerScratch chooses where to land the dump output. Returns
-// (hostPath, containerPath, needsDockerCp).
-//
-// Priority:
-//  1. A subdir of cfg.Source.DataDir (guaranteed bind-mounted).
-//  2. cfg.Source.RemoteWorkDir if it's under a bind mount.
-//  3. Container /tmp (docker-cp fallback — small, only usable for
-//     very small instances).
-func pickDockerScratch(cfg *config.Config, mounts [][2]string) (hostPath, containerPath string, needsDockerCp bool) {
+// (hostPath, containerPath, needsDockerCp). Priority:
+//  1. cfg.Source.RemoteWorkDir if it's bind-mounted (init sets this
+//     explicitly, so operator sees the chosen path in config.yaml).
+//  2. A subdir of cfg.Source.DataDir (fallback if RemoteWorkDir is
+//     unset or not under a mount).
+//  3. Container /tmp + docker cp (last resort).
+func pickDockerScratch(cfg *config.Config) (hostPath, containerPath string, needsDockerCp bool) {
+	d := cfg.Source.Docker
 	const subdir = "gitea2forgejo-dump"
 
+	if cfg.Source.RemoteWorkDir != "" {
+		if cc := d.HostToContainer(cfg.Source.RemoteWorkDir); cc != "" {
+			return cfg.Source.RemoteWorkDir, cc, false
+		}
+	}
 	if cfg.Source.DataDir != "" {
-		if cc := hostToContainer(cfg.Source.DataDir, mounts); cc != "" {
+		if cc := d.HostToContainer(cfg.Source.DataDir); cc != "" {
 			return path.Join(cfg.Source.DataDir, subdir),
 				path.Join(cc, subdir),
 				false
 		}
 	}
-	if cfg.Source.RemoteWorkDir != "" {
-		if cc := hostToContainer(cfg.Source.RemoteWorkDir, mounts); cc != "" {
-			return cfg.Source.RemoteWorkDir, cc, false
-		}
-	}
-	// Container /tmp — needs docker cp to get it out, and subject to
-	// tmpfs size limits.
 	return "", "/tmp/" + subdir, true
 }
 

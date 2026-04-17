@@ -81,14 +81,10 @@ type DB struct {
 // `forgejo doctor`, `forgejo admin regenerate hooks` etc. run inside the
 // named container.
 //
-// Path handling:
-//
-//   - RemoteWorkDir must be a HOST path that is bind-mounted INTO the
-//     container at the same path. `gitea dump --file $RemoteWorkDir/…`
-//     writes inside the container; the host sees the file at the same
-//     path via the bind mount, and the tool SFTPs it from there.
-//   - DataDir, RepoRoot, CustomDir should be the HOST paths of the
-//     container's data volumes. Rsync against the host paths directly.
+// The Mounts list records the bind mounts reported by `docker inspect` at
+// init time. Path translation (host ↔ container) uses this list so the
+// tool doesn't have to re-query Docker on every run, and so the operator
+// can see and edit the mapping.
 type Docker struct {
 	// Container is the container name or ID (as shown by `docker ps`).
 	Container string `yaml:"container"`
@@ -99,6 +95,85 @@ type Docker struct {
 	// Binary is the docker CLI to invoke. Default "docker"; set to
 	// "podman" for Podman or a custom path.
 	Binary string `yaml:"binary"`
+	// Mounts lists the bind mounts Docker reports for this container.
+	// Populated by `gitea2forgejo init` via `docker inspect`; the operator
+	// may edit entries here to override the discovered layout.
+	Mounts []Mount `yaml:"mounts,omitempty"`
+}
+
+// Mount is one bind-mount entry linking a host path to its container-side
+// destination. Matches the `Source`/`Destination` pair from `docker inspect`.
+type Mount struct {
+	Host      string `yaml:"host"`
+	Container string `yaml:"container"`
+}
+
+// HostToContainer performs longest-prefix lookup over d.Mounts and
+// returns the container-side equivalent of hostPath. Returns "" if no
+// mount matches (the caller should then treat the path as not reachable
+// from inside the container).
+func (d *Docker) HostToContainer(hostPath string) string {
+	if d == nil || hostPath == "" {
+		return ""
+	}
+	hp := trimRight(hostPath, "/")
+	best := -1
+	for i, m := range d.Mounts {
+		host := trimRight(m.Host, "/")
+		if hp == host || hasPathPrefix(hp, host+"/") {
+			if best < 0 || len(trimRight(d.Mounts[best].Host, "/")) < len(host) {
+				best = i
+			}
+		}
+	}
+	if best < 0 {
+		return ""
+	}
+	host := trimRight(d.Mounts[best].Host, "/")
+	cont := trimRight(d.Mounts[best].Container, "/")
+	rel := hp[len(host):]
+	return cleanPath(cont + rel)
+}
+
+// Local string utilities so config doesn't grow stdlib imports.
+func trimRight(s, cutset string) string {
+	for len(s) > 0 {
+		if !containsByte(cutset, s[len(s)-1]) {
+			return s
+		}
+		s = s[:len(s)-1]
+	}
+	return s
+}
+func containsByte(s string, b byte) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] == b {
+			return true
+		}
+	}
+	return false
+}
+func hasPathPrefix(s, prefix string) bool {
+	return len(s) >= len(prefix) && s[:len(prefix)] == prefix
+}
+func cleanPath(p string) string {
+	// Collapse any accidental double slashes. Good enough for the formats
+	// docker inspect emits on Linux.
+	out := make([]byte, 0, len(p))
+	prevSlash := false
+	for i := 0; i < len(p); i++ {
+		c := p[i]
+		if c == '/' {
+			if prevSlash {
+				continue
+			}
+			prevSlash = true
+		} else {
+			prevSlash = false
+		}
+		out = append(out, c)
+	}
+	return string(out)
 }
 
 type Storage struct {
