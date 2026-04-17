@@ -1,0 +1,98 @@
+# gitea2forgejo configuration.
+# Copy to config.yaml and fill in. Values prefixed with "env:" are read from
+# environment variables at run time (e.g. env:GITEA_ADMIN_TOKEN).
+
+source:
+  url: https://gitea.example.com
+  admin_token: env:GITEA_ADMIN_TOKEN
+  insecure_tls: false
+
+  # SSH access to the Gitea host (for gitea dump, file rsync, DB dump).
+  # Omit the whole block to run in API-only mode (documented data loss applies).
+  ssh:
+    host: gitea.example.com
+    port: 22
+    user: root
+    key: ~/.ssh/id_ed25519
+
+  # Path to app.ini and the Gitea data directory on the source host.
+  config_file: /etc/gitea/app.ini
+  data_dir: /var/lib/gitea
+  repo_root: /var/lib/gitea/git/repositories
+  custom_dir: /var/lib/gitea/custom
+
+  # Path to the gitea binary on the source host; default: "gitea" in PATH.
+  binary: gitea
+  # If set, prefix `gitea dump` with `sudo -u <run_as>`. Typical value: "gitea".
+  run_as: gitea
+  # Scratch dir on the source host for dump output before download.
+  remote_work_dir: /tmp/gitea2forgejo
+
+  # Native DB access. Dialect: postgres | mysql | sqlite3.
+  db:
+    dialect: postgres
+    dsn: env:GITEA_DB_DSN   # e.g. postgres://gitea:***@localhost:5432/gitea?sslmode=disable
+
+  # Optional: external object storage (S3/MinIO). Omit if storage.* is local disk.
+  storage:
+    type: s3
+    endpoint: https://s3.example.com
+    bucket: gitea-data
+    access_key: env:GITEA_S3_ACCESS_KEY
+    secret_key: env:GITEA_S3_SECRET_KEY
+    region: us-east-1
+
+target:
+  url: https://forgejo.example.com
+  admin_token: env:FORGEJO_ADMIN_TOKEN
+  insecure_tls: false
+
+  ssh:
+    host: forgejo.example.com
+    port: 22
+    user: root
+    key: ~/.ssh/id_ed25519
+
+  config_file: /etc/forgejo/app.ini
+  data_dir: /var/lib/forgejo
+  repo_root: /var/lib/forgejo/git/repositories
+  custom_dir: /var/lib/forgejo/custom
+
+  db:
+    dialect: postgres
+    dsn: env:FORGEJO_DB_DSN
+
+  storage:
+    type: s3
+    endpoint: https://s3.example.com
+    bucket: forgejo-data
+    access_key: env:FORGEJO_S3_ACCESS_KEY
+    secret_key: env:FORGEJO_S3_SECRET_KEY
+    region: us-east-1
+
+# Local directory for dump tarballs, manifests, checkpoint state, reports.
+# Needs free space >= 2x source data_dir size.
+work_dir: /var/cache/gitea2forgejo
+
+# URL rewrites applied during `supplement` phase to webhook URLs,
+# OAuth2 callback URLs, and mirror URLs.
+hostname_rewrites:
+  - from: gitea.example.com
+    to: forgejo.example.com
+
+# Options.
+options:
+  # Drain queues and stop source Gitea before dump (strict cutover).
+  # If false, put source in OFFLINE_MODE only (still online, read-only).
+  stop_source: true
+
+  # Rewrite clone URLs inside issue/PR bodies. History-mutating; off by default.
+  rewrite_issue_bodies: false
+
+  # Passed to `gitea dump`: tar.zst (recommended), tar.gz, tar, zip.
+  dump_format: tar.zst
+
+  # Skip individual dump stages (useful for rehearsals).
+  skip_gitea_dump: false
+  skip_native_db: false
+  skip_s3_mirror: false

@@ -1,0 +1,26 @@
+# Build artifacts
+/gitea2forgejo
+/bin/
+/dist/
+
+# Work directory (dump artifacts, manifests, state)
+/work/
+*.dump
+*.sql
+*.tar.zst
+*.tar.gz
+
+# Config files with secrets
+config.yaml
+config.*.yaml
+!example.config.yaml
+
+# Go
+*.test
+*.out
+vendor/
+
+# Editor
+.idea/
+.vscode/
+*.swp
