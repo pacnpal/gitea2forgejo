@@ -23,7 +23,7 @@ func Doctor(ssh *remote.Client, cfg *config.Config, log *slog.Logger) error {
 	logPath := "/tmp/gitea2forgejo-doctor.log"
 	parts := []string{
 		shQuote(binary), "doctor", "check", "--all", "--fix",
-		"--config", shQuote(cfg.Target.ConfigFile),
+		"--config", shQuote(targetConfigPath(cfg)),
 		"--log-file", shQuote(logPath),
 	}
 	cmd := strings.Join(parts, " ")
@@ -50,7 +50,7 @@ func RegenerateHooks(ssh *remote.Client, cfg *config.Config, log *slog.Logger) e
 	}
 	parts := []string{
 		shQuote(binary), "admin", "regenerate", "hooks",
-		"--config", shQuote(cfg.Target.ConfigFile),
+		"--config", shQuote(targetConfigPath(cfg)),
 	}
 	cmd := strings.Join(parts, " ")
 	if cfg.Target.Docker != nil && cfg.Target.Docker.Container != "" {
@@ -65,6 +65,22 @@ func RegenerateHooks(ssh *remote.Client, cfg *config.Config, log *slog.Logger) e
 	}
 	log.Info("regenerate hooks: done")
 	return nil
+}
+
+// targetConfigPath returns the path to pass to Forgejo as --config.
+// For Docker targets it translates cfg.Target.ConfigFile host→container
+// via the recorded mounts; when translation fails (operator wrote a
+// container-internal path directly, or the file isn't under any bind
+// mount) it returns the original path verbatim so the subsequent
+// forgejo process surfaces the real error.
+func targetConfigPath(cfg *config.Config) string {
+	if cfg.Target.Docker == nil || cfg.Target.Docker.Container == "" {
+		return cfg.Target.ConfigFile
+	}
+	if cc := cfg.Target.Docker.HostToContainer(cfg.Target.ConfigFile); cc != "" {
+		return cc
+	}
+	return cfg.Target.ConfigFile
 }
 
 // sshStreamer wraps slog for RunStream output.

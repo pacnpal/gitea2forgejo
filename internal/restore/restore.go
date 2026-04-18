@@ -34,6 +34,14 @@ func Run(cfg *config.Config, log *slog.Logger) error {
 	}
 	defer ssh.Close()
 
+	// Populate target.docker.mounts from `docker inspect` if the config
+	// didn't record any. Mirrors dump's behavior so older config.yaml
+	// files keep working. All downstream host→container path translation
+	// (chown, doctor --config, regenerate-hooks) depends on this list.
+	if err := ensureTargetMounts(ssh, cfg, log); err != nil {
+		return fmt.Errorf("discover target mounts: %w", err)
+	}
+
 	// Detect a pre-populated target DB BEFORE the expensive tar extract +
 	// rsync — otherwise the operator watches 40GB move for several minutes
 	// only to hit this failure at the end. pg_restore --clean only drops
