@@ -363,6 +363,38 @@ func orDefaultStr(v, d string) string {
 	return v
 }
 
+// WipeUnexpectedAuthorizedKeys deletes the authorized_keys file on the
+// target host so Forgejo regenerates it from the public_key table at
+// startup. Forgejo v15 refuses to start if authorized_keys contains
+// keys whose fingerprints aren't in the DB:
+//
+//	[F] An unexpected ssh public key was discovered. Forgejo will shutdown.
+//	    Key on line N of /data/git/.ssh/authorized_keys does not exist in database
+//
+// Long-lived Gitea instances accumulate this drift — keys left over
+// from deleted users, manual edits, or prior failed restores. Letting
+// Forgejo regenerate the file from the DB is option 1 of its three
+// suggested fixes and the cleanest of them.
+//
+// authorized_keys lives next to the repo tree at
+//
+//	<repo_root>/../.ssh/authorized_keys
+//
+// on the host side, which bind-mounts to /data/git/.ssh/authorized_keys
+// inside the Forgejo container.
+func WipeUnexpectedAuthorizedKeys(ssh *remote.Client, cfg *config.Config, log *slog.Logger) error {
+	if cfg.Target.RepoRoot == "" {
+		return nil
+	}
+	authKeys := filepath.Dir(cfg.Target.RepoRoot) + "/.ssh/authorized_keys"
+	log.Info("wiping authorized_keys so Forgejo regenerates it from DB", "path", authKeys)
+	out, err := ssh.Run("rm -f " + shQuote(authKeys))
+	if err != nil {
+		return fmt.Errorf("remove %s: %w (%s)", authKeys, err, string(out))
+	}
+	return nil
+}
+
 // ChownInContainer re-runs chown through `docker exec -u 0` against the
 // already-started Forgejo container. The pre-start sidecar chown
 // (chownViaDocker) gets everything that exists on disk before boot,

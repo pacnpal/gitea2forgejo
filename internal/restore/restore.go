@@ -105,6 +105,13 @@ func Run(cfg *config.Config, log *slog.Logger) error {
 	if err := Chown(ssh, cfg, log); err != nil {
 		return fmt.Errorf("chown: %w", err)
 	}
+	// Remove any stale authorized_keys file so Forgejo regenerates it
+	// from the public_key table at boot. Forgejo v15 refuses to start
+	// when authorized_keys contains fingerprints not in the DB — very
+	// common on long-lived Gitea instances.
+	if err := WipeUnexpectedAuthorizedKeys(ssh, cfg, log); err != nil {
+		return fmt.Errorf("wipe authorized_keys: %w", err)
+	}
 	if err := StartService(ssh, cfg, log); err != nil {
 		return fmt.Errorf("start forgejo: %w", err)
 	}
