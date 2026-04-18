@@ -1,0 +1,158 @@
+# After a release publishes, bump the Homebrew formula in
+# pacnpal/homebrew-gitea2forgejo to match. The formula's SHA256 blocks
+# are regenerated from the just-uploaded release assets.
+#
+# Security: all user-controllable values (workflow_dispatch input,
+# release tag) are piped through env: so they can never land directly
+# in a shell run: block. Release tag names are already validated by
+# GitHub (git ref name constraints), but routing them through env
+# still keeps the pattern consistent.
+#
+# Requires a PAT with `repo` scope on pacnpal/homebrew-gitea2forgejo
+# stored as TAP_PUSH_TOKEN (GITHUB_TOKEN can't push cross-repo).
+
+name: Bump Homebrew tap
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version tag to bump to (e.g. v0.2.9)"
+        required: true
+
+permissions: read-all
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    env:
+      DISPATCH_VERSION: ${{ inputs.version }}
+      RELEASE_TAG:      ${{ github.event.release.tag_name }}
+    steps:
+      - name: Resolve and validate target version
+        id: ver
+        run: |
+          set -euo pipefail
+          TAG="${DISPATCH_VERSION:-$RELEASE_TAG}"
+          # Defense in depth: reject anything that isn't a plain semver
+          # tag of the form vX.Y.Z[-preN]. This prevents shell-special
+          # chars from landing in subsequent `run:` expansions even if
+          # a future change slips back to direct interpolation.
+          if ! printf '%s' "$TAG" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?$'; then
+            echo "refusing to run with malformed tag: $TAG" >&2
+            exit 1
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Download release binaries and compute SHA256s
+        id: hashes
+        env:
+          TAG: ${{ steps.ver.outputs.tag }}
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/g2f
+          for p in linux-amd64 linux-arm64 darwin-amd64 darwin-arm64; do
+            curl -fsSL --retry 5 --retry-delay 10 \
+              -o "/tmp/g2f/${p}" \
+              "https://github.com/pacnpal/gitea2forgejo/releases/download/${TAG}/gitea2forgejo-${p}"
+            sum="$(sha256sum "/tmp/g2f/${p}" | awk '{print $1}')"
+            echo "${p}=${sum}" >> "$GITHUB_OUTPUT"
+          done
+
+      - name: Checkout homebrew tap
+        uses: actions/checkout@v5
+        with:
+          repository: pacnpal/homebrew-gitea2forgejo
+          token: ${{ secrets.TAP_PUSH_TOKEN }}
+          path: tap
+
+      - name: Rewrite formula
+        env:
+          TAG: ${{ steps.ver.outputs.tag }}
+          LINUX_AMD64:  ${{ steps.hashes.outputs.linux-amd64 }}
+          LINUX_ARM64:  ${{ steps.hashes.outputs.linux-arm64 }}
+          DARWIN_AMD64: ${{ steps.hashes.outputs.darwin-amd64 }}
+          DARWIN_ARM64: ${{ steps.hashes.outputs.darwin-arm64 }}
+        run: |
+          set -euo pipefail
+          # Strip leading 'v' for the Homebrew `version` field.
+          VER="${TAG#v}"
+          cat > tap/Formula/gitea2forgejo.rb <<'RUBY'
+          class Gitea2forgejo < Formula
+            desc "One-time, full-fidelity migration from Gitea >=1.23 to Forgejo v15+"
+            homepage "https://github.com/pacnpal/gitea2forgejo"
+            version "__VER__"
+            license "MIT"
+
+            on_macos do
+              on_arm do
+                url "https://github.com/pacnpal/gitea2forgejo/releases/download/v#{version}/gitea2forgejo-darwin-arm64"
+                sha256 "__DARWIN_ARM64__"
+              end
+              on_intel do
+                url "https://github.com/pacnpal/gitea2forgejo/releases/download/v#{version}/gitea2forgejo-darwin-amd64"
+                sha256 "__DARWIN_AMD64__"
+              end
+            end
+
+            on_linux do
+              on_arm do
+                url "https://github.com/pacnpal/gitea2forgejo/releases/download/v#{version}/gitea2forgejo-linux-arm64"
+                sha256 "__LINUX_ARM64__"
+              end
+              on_intel do
+                url "https://github.com/pacnpal/gitea2forgejo/releases/download/v#{version}/gitea2forgejo-linux-amd64"
+                sha256 "__LINUX_AMD64__"
+              end
+            end
+
+            depends_on "rsync"
+            depends_on "libpq"
+            depends_on "mysql-client"
+            depends_on "sqlite"
+            depends_on "zstd"
+
+            def install
+              platform =
+                case [OS.mac?, Hardware::CPU.arm?]
+                when [true,  true]  then "darwin-arm64"
+                when [true,  false] then "darwin-amd64"
+                when [false, true]  then "linux-arm64"
+                else                     "linux-amd64"
+                end
+              bin.install "gitea2forgejo-#{platform}" => "gitea2forgejo"
+            end
+
+            test do
+              assert_match(/gitea2forgejo/, shell_output("#{bin}/gitea2forgejo --version"))
+            end
+          end
+          RUBY
+          # Substitute placeholders via sed — no shell interpolation in
+          # the heredoc body, so there's no chance of injection via
+          # formula contents.
+          sed -i \
+            -e "s|__VER__|${VER}|g" \
+            -e "s|__DARWIN_ARM64__|${DARWIN_ARM64}|g" \
+            -e "s|__DARWIN_AMD64__|${DARWIN_AMD64}|g" \
+            -e "s|__LINUX_ARM64__|${LINUX_ARM64}|g" \
+            -e "s|__LINUX_AMD64__|${LINUX_AMD64}|g" \
+            tap/Formula/gitea2forgejo.rb
+
+      - name: Commit and push
+        env:
+          TAG: ${{ steps.ver.outputs.tag }}
+        run: |
+          set -euo pipefail
+          cd tap
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git diff --quiet; then
+            echo "formula already up-to-date for ${TAG}"
+            exit 0
+          fi
+          git add Formula/gitea2forgejo.rb
+          git commit -m "gitea2forgejo ${TAG}"
+          git push
