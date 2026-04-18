@@ -66,6 +66,14 @@ iwr -useb https://raw.githubusercontent.com/pacnpal/gitea2forgejo/main/install.p
 The installer script:
 
 - Detects your OS and CPU (amd64 / arm64)
+- **Installs all external tool dependencies** via the platform package manager:
+  - **Debian/Ubuntu**: `apt` → `rsync openssh-client sqlite3 postgresql-client default-mysql-client zstd`
+  - **Fedora/RHEL/CentOS**: `dnf`/`yum` → `rsync openssh-clients sqlite postgresql mariadb zstd`
+  - **Arch**: `pacman` → `rsync openssh sqlite postgresql-libs mariadb-clients zstd`
+  - **Alpine**: `apk` → `rsync openssh-client sqlite postgresql-client mariadb-client zstd`
+  - **openSUSE**: `zypper` → `rsync openssh sqlite3 postgresql mariadb-client zstd`
+  - **macOS**: `brew` → `postgresql mysql-client zstd` (rsync/ssh/sqlite preinstalled)
+  - **Windows**: `winget` → `OpenSSH, Git, PostgreSQL, SQLite, zstd` (for full `dump`/`restore` flows, WSL2 is recommended)
 - Resolves the latest release tag via GitHub's `/releases/latest` redirect
 - Downloads the matching binary
 - On Linux: installs to `/usr/local/bin/gitea2forgejo` (prompts for `sudo` if the directory isn't writable)
@@ -77,6 +85,7 @@ The installer script:
 
 - `INSTALL_DIR` — override the target directory
 - `VERSION` — pin a specific release tag (`VERSION=v0.2.9 curl ... | bash`)
+- `SKIP_DEPS` — set to `1` to skip the dependency install step
 
 **To update later:** just run `gitea2forgejo update`, or re-run the installer — both are idempotent.
 

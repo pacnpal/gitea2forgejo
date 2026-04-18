@@ -6,10 +6,14 @@
 # Environment variable overrides:
 #   $env:INSTALL_DIR  install directory (default: %LOCALAPPDATA%\Programs\gitea2forgejo)
 #   $env:VERSION      version tag to install (default: latest release)
+#   $env:SKIP_DEPS    set to 1 to skip the dependency install step
 #
-# The script detects CPU, downloads the matching .exe from the latest
-# GitHub release, stages it under LocalAppData, and adds the directory
-# to the user PATH (no admin rights needed).
+# The script:
+#   1. Detects CPU (amd64/arm64)
+#   2. Installs dependencies via winget (OpenSSH, Git, rsync,
+#      PostgreSQL client, SQLite, zstd)
+#   3. Downloads the matching .exe from the latest GitHub release
+#   4. Stages it under LocalAppData and adds to the user PATH (no admin)
 
 $ErrorActionPreference = 'Stop'
 $Repo = 'pacnpal/gitea2forgejo'
@@ -20,6 +24,41 @@ function Write-Info  ($m) { Write-Host "» $m" -ForegroundColor Blue }
 function Write-Ok    ($m) { Write-Host "✓ $m" -ForegroundColor Green }
 function Write-Warn2 ($m) { Write-Host "! $m" -ForegroundColor Yellow }
 function Die         ($m) { Write-Host "✗ $m" -ForegroundColor Red; exit 1 }
+
+function Install-Deps {
+    if ($env:SKIP_DEPS -eq '1') {
+        Write-Info "skipping dependency install (SKIP_DEPS=1)"
+        return
+    }
+    # Native PowerShell on Windows can't run gitea2forgejo's full migration
+    # (rsync/pg_dump/tar-with-zstd are POSIX tools). We still install the
+    # preflight/manifest-only flow's dependencies here; for dump/restore
+    # the operator will want WSL2 with a full Linux userland.
+    if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
+        Write-Warn2 "winget not found — install App Installer from the Microsoft Store"
+        Write-Warn2 "then re-run this installer, or install dependencies manually:"
+        Write-Warn2 "  OpenSSH, Git, PostgreSQL client, SQLite, rsync (via WSL2 for full features)"
+        return
+    }
+    Write-Info "installing dependencies via winget ..."
+    $deps = @(
+        'Microsoft.OpenSSH.Beta',         # ssh-keygen, ssh-keyscan, ssh-copy-id
+        'Git.Git',                        # git + bundled utilities
+        'PostgreSQL.PostgreSQL.16',       # pg_dump, pg_restore
+        'SQLite.SQLite',                  # sqlite3
+        'Facebook.Zstandard'              # zstd (for tar.zst extraction)
+    )
+    foreach ($pkg in $deps) {
+        try {
+            winget install --id $pkg --silent --accept-package-agreements --accept-source-agreements --disable-interactivity 2>&1 | Out-Null
+            Write-Ok "  $pkg"
+        } catch {
+            Write-Warn2 "  $pkg (skipped / already present / failed)"
+        }
+    }
+    Write-Warn2 "Full dump/restore also needs rsync. On Windows, the recommended path is"
+    Write-Warn2 "WSL2 + a Debian/Ubuntu distro, then run the Linux installer inside that."
+}
 
 function Detect-Arch {
     switch ($env:PROCESSOR_ARCHITECTURE) {
@@ -49,6 +88,9 @@ Write-Host ""
 $arch = Detect-Arch
 $platform = "windows-$arch"
 Write-Info "platform:     $platform"
+
+Install-Deps
+Write-Host ""
 
 if (-not $Version) { $Version = Get-LatestVersion }
 Write-Info "version:      $Version"

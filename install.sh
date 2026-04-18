@@ -7,11 +7,15 @@
 # Environment variable overrides:
 #   INSTALL_DIR  where to place the binary (default: /usr/local/bin)
 #   VERSION      version tag to install (default: latest release)
+#   SKIP_DEPS    set to 1 to skip the dependency install step
 #
-# The script detects OS + CPU, downloads the matching release binary,
-# installs it to INSTALL_DIR (prompting for sudo if needed), and on
-# macOS also strips com.apple.quarantine + applies an ad-hoc codesign
-# so Gatekeeper doesn't refuse the first invocation.
+# The script detects OS + CPU, installs the external tools gitea2forgejo
+# shells out to (rsync, openssh-client, sqlite3, postgresql-client,
+# mysql/mariadb-client, zstd) via the platform package manager, then
+# downloads the matching release binary and installs it to INSTALL_DIR
+# (prompting for sudo if needed). On macOS it also strips
+# com.apple.quarantine + applies an ad-hoc codesign so Gatekeeper doesn't
+# refuse the first invocation.
 
 set -euo pipefail
 
@@ -57,6 +61,80 @@ detect_arch() {
   esac
 }
 
+# ─── dependency install ────────────────────────────────────────────────────
+sudo_if_needed() {
+  if [ "$(id -u)" = 0 ]; then
+    "$@"
+  else
+    sudo "$@"
+  fi
+}
+
+install_deps() {
+  [ "${SKIP_DEPS:-0}" = 1 ] && { info "skipping dependency install (SKIP_DEPS=1)"; return; }
+
+  if [ "$OS" = "darwin" ]; then
+    if command -v brew >/dev/null 2>&1; then
+      info "installing dependencies via Homebrew ..."
+      # macOS has rsync/ssh/sqlite/zstd preinstalled; brew for the DB clients.
+      brew install --quiet postgresql@16 mysql-client zstd 2>&1 | sed 's/^/    /' || true
+      ok "dependencies installed (or already present)"
+    else
+      warn "Homebrew not found. Install pg_dump/mysql/zstd manually:"
+      warn "  https://brew.sh  then:  brew install postgresql mysql-client zstd"
+    fi
+    return
+  fi
+
+  # Linux: detect package manager.
+  if command -v apt-get >/dev/null 2>&1; then
+    info "installing dependencies via apt ..."
+    # Debian 13+ replaced mysql-client with default-mysql-client.
+    sudo_if_needed apt-get update -qq
+    if ! sudo_if_needed apt-get install -y --no-install-recommends \
+        rsync openssh-client sqlite3 postgresql-client default-mysql-client zstd \
+        >/dev/null 2>&1; then
+      # Fallback for Debian 12 / older Ubuntu where default-mysql-client is absent.
+      sudo_if_needed apt-get install -y --no-install-recommends \
+        rsync openssh-client sqlite3 postgresql-client mysql-client zstd || {
+          warn "apt install hit errors; some optional packages may be missing"
+        }
+    fi
+    ok "dependencies installed via apt"
+  elif command -v dnf >/dev/null 2>&1; then
+    info "installing dependencies via dnf ..."
+    sudo_if_needed dnf install -y rsync openssh-clients sqlite postgresql mariadb zstd \
+      >/dev/null 2>&1 || warn "dnf install hit errors; optional packages may be missing"
+    ok "dependencies installed via dnf"
+  elif command -v yum >/dev/null 2>&1; then
+    info "installing dependencies via yum ..."
+    sudo_if_needed yum install -y rsync openssh-clients sqlite postgresql mariadb zstd \
+      >/dev/null 2>&1 || warn "yum install hit errors"
+    ok "dependencies installed via yum"
+  elif command -v pacman >/dev/null 2>&1; then
+    info "installing dependencies via pacman ..."
+    sudo_if_needed pacman -S --needed --noconfirm \
+      rsync openssh sqlite postgresql-libs mariadb-clients zstd \
+      >/dev/null 2>&1 || warn "pacman install hit errors"
+    ok "dependencies installed via pacman"
+  elif command -v zypper >/dev/null 2>&1; then
+    info "installing dependencies via zypper ..."
+    sudo_if_needed zypper --non-interactive install \
+      rsync openssh sqlite3 postgresql mariadb-client zstd \
+      >/dev/null 2>&1 || warn "zypper install hit errors"
+    ok "dependencies installed via zypper"
+  elif command -v apk >/dev/null 2>&1; then
+    info "installing dependencies via apk ..."
+    sudo_if_needed apk add --no-progress \
+      rsync openssh-client sqlite postgresql-client mariadb-client zstd \
+      >/dev/null 2>&1 || warn "apk install hit errors"
+    ok "dependencies installed via apk"
+  else
+    warn "no recognized package manager — install these manually:"
+    warn "  rsync, openssh, sqlite3, postgresql client, mysql/mariadb client, zstd"
+  fi
+}
+
 latest_version() {
   # Follow the /releases/latest redirect to avoid needing jq. The Location
   # header ends with the tag name.
@@ -76,6 +154,9 @@ OS="$(detect_os)"
 ARCH="$(detect_arch)"
 PLATFORM="${OS}-${ARCH}"
 info "platform:     ${PLATFORM}"
+
+install_deps
+echo
 
 if [ -z "$VERSION" ]; then
   VERSION="$(latest_version)"
