@@ -40,6 +40,11 @@ func main() {
 		Short:   "One-time, full-fidelity migration from Gitea ≥1.23 to Forgejo v15+",
 		Version: fmt.Sprintf("%s (commit %s)", version, commit),
 		PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
+			// Emit the version banner as the very first line of stderr
+			// for every subcommand. Helps users attach the right build
+			// to bug reports without having to re-run with --version.
+			fmt.Fprintf(os.Stderr, "gitea2forgejo %s (commit %s)\n", version, commit)
+
 			lvl := slog.LevelInfo
 			switch logLevel {
 			case "debug":
