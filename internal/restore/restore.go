@@ -91,6 +91,14 @@ func Run(cfg *config.Config, log *slog.Logger) error {
 	if err := SchemaTrick(cfg, log); err != nil {
 		return fmt.Errorf("schema trick: %w", err)
 	}
+	// Delete rows that would violate Forgejo v15's new FK constraints.
+	// Gitea historically didn't cascade deletes of action_runner_token
+	// rows when their owner user / repo was removed, so an imported
+	// long-lived DB can carry orphans that make Forgejo's migration
+	// layer crash-loop on startup.
+	if err := CleanOrphanFKs(cfg, log); err != nil {
+		return fmt.Errorf("fk cleanup: %w", err)
+	}
 	if err := WipeBleve(ssh, cfg, log); err != nil {
 		return fmt.Errorf("wipe bleve: %w", err)
 	}
