@@ -402,24 +402,33 @@ func chownViaDocker(ssh *remote.Client, cfg *config.Config, log *slog.Logger) er
 	user := orDefaultStr(d.User, "git")
 	spec := user + ":" + user
 
-	// Collect container-side paths to chown. Warn (not fail) for paths
-	// that aren't under any bind mount — usually a stale container-style
-	// default in cfg.Target.CustomDir that has no host-side equivalent
-	// to touch.
-	var dirs []string
-	for _, hostDir := range []string{cfg.Target.DataDir, cfg.Target.RepoRoot, cfg.Target.CustomDir} {
-		if hostDir == "" {
+	// Collect (host, container) path pairs for every configured data dir
+	// that (a) translates to a container path via the bind-mount table
+	// and (b) actually exists on the host. Gitea dumps commonly omit
+	// the custom/ subdir, leaving cfg.Target.CustomDir with no host-
+	// side directory to touch; passing a missing path to chown makes
+	// the whole batched invocation exit 1. test -d on the host side
+	// is cheap and avoids round-tripping through docker just to fail.
+	type entry struct{ host, cont string }
+	var entries []entry
+	for _, h := range []string{cfg.Target.DataDir, cfg.Target.RepoRoot, cfg.Target.CustomDir} {
+		if h == "" {
 			continue
 		}
-		cd := d.HostToContainer(hostDir)
-		if cd == "" {
+		cont := d.HostToContainer(h)
+		if cont == "" {
 			log.Warn("chown (docker): host path not under any bind mount; skipping",
-				"host", hostDir)
+				"host", h)
 			continue
 		}
-		dirs = append(dirs, cd)
+		if _, err := ssh.Run(fmt.Sprintf("test -d %s", shQuote(h))); err != nil {
+			log.Warn("chown (docker): host path not present on target; skipping",
+				"host", h)
+			continue
+		}
+		entries = append(entries, entry{h, cont})
 	}
-	if len(dirs) == 0 {
+	if len(entries) == 0 {
 		return nil
 	}
 
@@ -441,18 +450,27 @@ func chownViaDocker(ssh *remote.Client, cfg *config.Config, log *slog.Logger) er
 		return fmt.Errorf("container %q has no recorded image", d.Container)
 	}
 
+	// Forgejo's official image ships USER 1000:1000 so its default
+	// process runs as the unprivileged git user. Overriding the
+	// entrypoint doesn't reset the user, so chown -R on root-owned
+	// files (those rsync just wrote as the SSH user) fails with
+	// EPERM. Force the sidecar to root; the chown target is still
+	// git:git because /etc/passwd comes from the Forgejo image.
 	args := []string{
 		shQuote(bin), "run", "--rm",
+		"--user", "0:0",
 		"--volumes-from", shQuote(d.Container),
 		"--entrypoint", "chown",
 		shQuote(image),
 		"-R", shQuote(spec),
 	}
-	for _, dir := range dirs {
-		args = append(args, shQuote(dir))
+	var contDirs []string
+	for _, e := range entries {
+		args = append(args, shQuote(e.cont))
+		contDirs = append(contDirs, e.cont)
 	}
 	cmd := strings.Join(args, " ")
-	log.Info("chown (docker sidecar)", "image", image, "dirs", dirs, "owner", spec)
+	log.Info("chown (docker sidecar)", "image", image, "dirs", contDirs, "owner", spec)
 	out, err := ssh.Run(cmd)
 	if err != nil {
 		return fmt.Errorf("chown via sidecar: %w (%s)", err, string(out))
