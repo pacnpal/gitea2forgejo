@@ -135,21 +135,31 @@ func isLocalPath(p string) bool {
 	return false
 }
 
-// StageFiles extracts the dump and rsyncs its data/repos/custom subtrees to
-// the target host, preserving Git hooks and OIDC JWT signing keys.
+// StageFiles extracts the dump and gets its data/repos/custom subtrees
+// to the target host. Two code paths:
+//
+//   LOCAL fast path (target filesystem accessible from this process):
+//     Extract directly onto the target filesystem in a staging dir,
+//     then rename the subdirs into place. rename within one fs is
+//     O(1) — zero bytes copied after the extract itself. Falls back
+//     to rsync for any subdir whose rename fails (cross-fs, existing
+//     non-empty dest, etc.).
+//
+//   REMOTE path (target behind SSH):
+//     Extract locally to work_dir/extracted/ then rsync each subtree
+//     over SSH. No way around the byte transfer in this case.
 func StageFiles(cfg *config.Config, log *slog.Logger) error {
+	if isLocalPath(cfg.Target.DataDir) {
+		return stageFilesLocal(cfg, log)
+	}
+	return stageFilesRemote(cfg, log)
+}
+
+func stageFilesRemote(cfg *config.Config, log *slog.Logger) error {
 	extracted, err := ExtractDump(cfg, log)
 	if err != nil {
 		return err
 	}
-	// Typical layout produced by `gitea dump`:
-	//   extracted/
-	//     app.ini              (may be present; we translate separately)
-	//     custom/
-	//     data/
-	//     repos/
-	//     gitea-db.sql         (xorm SQL — unused; we restore the native dump instead)
-	//     log/                 (skipped)
 	mapping := []struct{ local, remote string }{
 		{filepath.Join(extracted, "data"), cfg.Target.DataDir},
 		{filepath.Join(extracted, "repos"), cfg.Target.RepoRoot},
@@ -161,6 +171,111 @@ func StageFiles(cfg *config.Config, log *slog.Logger) error {
 		}
 	}
 	return nil
+}
+
+// stageFilesLocal is the loopback optimization: extract the tarball
+// onto the target's OWN filesystem, then rename the subdirs into their
+// final homes. No cross-fs copy except the tar decompression itself.
+func stageFilesLocal(cfg *config.Config, log *slog.Logger) error {
+	ext := cfg.Options.DumpFormat
+	tarPath := filepath.Join(cfg.WorkDir, "gitea-dump."+ext)
+	if _, err := os.Stat(tarPath); err != nil {
+		return fmt.Errorf("dump tarball not found: %w", err)
+	}
+
+	// Staging dir on the target's filesystem (sibling of data_dir). This
+	// placement means os.Rename below lands in O(1) when the target
+	// subdirs are on the same fs — which they always are within a
+	// single appdata tree.
+	stage := filepath.Join(filepath.Dir(cfg.Target.DataDir), ".gitea2forgejo-stage")
+	if err := os.RemoveAll(stage); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("clean stale staging %s: %w", stage, err)
+	}
+	if err := os.MkdirAll(stage, 0o755); err != nil {
+		return fmt.Errorf("mkdir staging %s: %w", stage, err)
+	}
+	defer func() { _ = os.RemoveAll(stage) }()
+
+	log.Info("extract: on target filesystem (loopback fast path)",
+		"tar", tarPath, "stage", stage)
+	if err := extractInto(tarPath, stage, ext, log); err != nil {
+		return fmt.Errorf("extract: %w", err)
+	}
+
+	// Rename subdirs into place. For each subtree in the tarball, the
+	// rename is O(1) intra-filesystem. Cross-filesystem renames (EXDEV)
+	// fall back to rsync.
+	mapping := []struct{ src, dst string }{
+		{filepath.Join(stage, "data"), cfg.Target.DataDir},
+		{filepath.Join(stage, "repos"), cfg.Target.RepoRoot},
+		{filepath.Join(stage, "custom"), cfg.Target.CustomDir},
+	}
+	for _, m := range mapping {
+		if _, err := os.Stat(m.src); err != nil {
+			log.Info("staging: tarball subdir absent; skipping", "path", m.src)
+			continue
+		}
+		if err := moveIntoPlace(cfg, m.src, m.dst, log); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// extractInto shells out to the system tar with the right decompressor
+// flag. Mirrors ExtractDump's dispatch but writes to an arbitrary path.
+func extractInto(tarPath, dst, ext string, log *slog.Logger) error {
+	args := []string{"-x", "-f", tarPath, "-C", dst}
+	switch ext {
+	case "tar.zst":
+		args = append([]string{"--zstd"}, args...)
+	case "tar.gz":
+		args = append([]string{"-z"}, args...)
+	case "tar":
+	case "zip":
+		return runCmd(exec.Command("unzip", "-q", tarPath, "-d", dst), log, "unzip")
+	default:
+		return fmt.Errorf("unsupported dump_format %q", ext)
+	}
+	return runCmd(exec.Command("tar", args...), log, "tar")
+}
+
+// moveIntoPlace gets a subtree from staging into its target location.
+// Tries rename first (intra-fs = O(1)); on EXDEV or a non-empty target
+// falls back to local rsync (still no SSH).
+func moveIntoPlace(cfg *config.Config, src, dst string, log *slog.Logger) error {
+	// Ensure parent of dst exists.
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		return fmt.Errorf("mkdir parent of %s: %w", dst, err)
+	}
+	// If dst exists and is empty, remove it so rename can land.
+	if empty, err := isEmptyDir(dst); err == nil && empty {
+		_ = os.RemoveAll(dst)
+	}
+	if err := os.Rename(src, dst); err == nil {
+		log.Info("staging: renamed into place (zero copy)", "dst", dst)
+		return nil
+	}
+	// Rename failed — fall back to rsync. Still local, still faster
+	// than SSH rsync.
+	log.Info("staging: rename failed; falling back to local rsync", "dst", dst)
+	return RsyncToTarget(cfg, src, dst, log)
+}
+
+func isEmptyDir(p string) (bool, error) {
+	f, err := os.Open(p)
+	if err != nil {
+		return false, err
+	}
+	defer f.Close()
+	names, err := f.Readdirnames(1)
+	if err == io.EOF || len(names) == 0 {
+		return true, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return false, nil
 }
 
 // StopService stops the target Forgejo. Docker targets use `docker stop
