@@ -49,7 +49,38 @@ this tool handles and what requires manual operator action.
 
 ## Install
 
-### Pre-built release binary (recommended)
+### One-line installer (recommended)
+
+**Linux / macOS:**
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/pacnpal/gitea2forgejo/main/install.sh | bash
+```
+
+**Windows (PowerShell):**
+
+```powershell
+iwr -useb https://raw.githubusercontent.com/pacnpal/gitea2forgejo/main/install.ps1 | iex
+```
+
+The installer script:
+
+- Detects your OS and CPU (amd64 / arm64)
+- Resolves the latest release tag via GitHub's `/releases/latest` redirect
+- Downloads the matching binary
+- On Linux: installs to `/usr/local/bin/gitea2forgejo` (prompts for `sudo` if the directory isn't writable)
+- On macOS: clears `com.apple.quarantine` and applies an ad-hoc `codesign` so Gatekeeper doesn't block the first run
+- On Windows: installs to `%LOCALAPPDATA%\Programs\gitea2forgejo\`, unblocks the file (removes SmartScreen zone marker), and adds the directory to your user `PATH`
+- Verifies the install with `gitea2forgejo --version`
+
+**Environment variable overrides** (same on both platforms):
+
+- `INSTALL_DIR` — override the target directory
+- `VERSION` — pin a specific release tag (`VERSION=v0.2.9 curl ... | bash`)
+
+**To update later:** just run `gitea2forgejo update`, or re-run the installer — both are idempotent.
+
+### Pre-built release binary (manual)
 
 Each release attaches static binaries for 6 platforms, built and signed by
 the [SLSA3 Go builder](https://github.com/slsa-framework/slsa-github-generator)
