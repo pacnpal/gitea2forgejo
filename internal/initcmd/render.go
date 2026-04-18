@@ -31,18 +31,15 @@ func buildConfig(
 		opt.TargetAppIni, tgt)
 	// Default target paths when the target had no discoverable app.ini
 	// (very common for a fresh Forgejo that hasn't been initialized).
-	if c.Target.ConfigFile == "" {
-		c.Target.ConfigFile = "/etc/forgejo/app.ini"
-	}
-	if c.Target.DataDir == "" {
-		c.Target.DataDir = "/var/lib/forgejo"
-	}
-	if c.Target.RepoRoot == "" {
-		c.Target.RepoRoot = "/var/lib/forgejo/git/repositories"
-	}
-	if c.Target.CustomDir == "" {
-		c.Target.CustomDir = "/var/lib/forgejo/custom"
-	}
+	// For containerized targets we translate forgejo's container-
+	// internal conventions to host paths via the probed mounts — chown,
+	// rsync and every other host-path consumer needs real host paths.
+	// Falls back to the container-style defaults when no mount covers
+	// the path (bare-metal or a layout this tool doesn't recognize).
+	setTargetDefault(&c.Target.ConfigFile, "/etc/forgejo/app.ini", c.Target.Docker)
+	setTargetDefault(&c.Target.DataDir, "/var/lib/forgejo", c.Target.Docker)
+	setTargetDefault(&c.Target.RepoRoot, "/var/lib/forgejo/git/repositories", c.Target.Docker)
+	setTargetDefault(&c.Target.CustomDir, "/var/lib/forgejo/custom", c.Target.Docker)
 	// Hostname rewrites: if URLs differ, pre-populate one rewrite rule.
 	if srcHost, tgtHost := hostFromURL(opt.SourceURL), hostFromURL(opt.TargetURL); srcHost != "" && tgtHost != "" && srcHost != tgtHost {
 		c.HostnameRewrites = []config.Rewrite{{From: srcHost, To: tgtHost}}
@@ -95,6 +92,9 @@ func populateInstance(
 		// won't exist for filesystem operations.
 		inst.DataDir = TranslateToHost(s.AppDataPath, mounts)
 		inst.RepoRoot = TranslateToHost(s.RepoRoot, mounts)
+		if s.CustomDir != "" {
+			inst.CustomDir = TranslateToHost(s.CustomDir, mounts)
+		}
 
 		inst.DB = config.DB{Dialect: s.DBType}
 		if s.DBType == "sqlite3" {
@@ -144,6 +144,24 @@ func populateInstance(
 		// that covers DataDir (if possible), else the first mount.
 		inst.RemoteWorkDir = chooseRemoteWorkDir(inst.DataDir, d)
 	}
+}
+
+// setTargetDefault fills in a config field that populateInstance left
+// blank. If the target is containerized and the probed mounts cover the
+// container-side default, it writes the translated host path so chown
+// and other host-side ops succeed. Otherwise the container-side default
+// is written as-is (bare-metal targets, or atypical container layouts).
+func setTargetDefault(field *string, containerDefault string, d *config.Docker) {
+	if *field != "" {
+		return
+	}
+	if d != nil && d.Container != "" {
+		if h := d.ContainerToHost(containerDefault); h != "" {
+			*field = h
+			return
+		}
+	}
+	*field = containerDefault
 }
 
 // chooseRemoteWorkDir picks a HOST path for dump scratch space. It

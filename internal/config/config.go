@@ -135,6 +135,37 @@ func (d *Docker) HostToContainer(hostPath string) string {
 	return cleanPath(cont + rel)
 }
 
+// ContainerToHost is the inverse of HostToContainer: longest-prefix
+// lookup over d.Mounts by the container side of each mount, returning
+// the corresponding host path. Returns "" if no mount matches.
+//
+// Used by `init` to seed host-side defaults for target paths when the
+// target Forgejo is fresh (no app.ini to probe) — converting container
+// conventions like /var/lib/forgejo into real host paths like
+// /mnt/user/appdata/forgejo.
+func (d *Docker) ContainerToHost(containerPath string) string {
+	if d == nil || containerPath == "" {
+		return ""
+	}
+	cp := trimRight(containerPath, "/")
+	best := -1
+	for i, m := range d.Mounts {
+		cont := trimRight(m.Container, "/")
+		if cp == cont || hasPathPrefix(cp, cont+"/") {
+			if best < 0 || len(trimRight(d.Mounts[best].Container, "/")) < len(cont) {
+				best = i
+			}
+		}
+	}
+	if best < 0 {
+		return ""
+	}
+	cont := trimRight(d.Mounts[best].Container, "/")
+	host := trimRight(d.Mounts[best].Host, "/")
+	rel := cp[len(cont):]
+	return cleanPath(host + rel)
+}
+
 // Local string utilities so config doesn't grow stdlib imports.
 func trimRight(s, cutset string) string {
 	for len(s) > 0 {
