@@ -117,7 +117,7 @@ func dumpSQLite(cfg *config.Config, log *slog.Logger) (string, error) {
 	out := filepath.Join(cfg.WorkDir, "gitea.sqlite")
 	log.Info("sqlite: fetching via SFTP", "from", srcPath, "to", out)
 	start := time.Now()
-	if err := cli.FetchFile(srcPath, out); err != nil {
+	if _, err := cli.FetchFile(srcPath, out); err != nil {
 		return "", fmt.Errorf("sftp fetch sqlite: %w", err)
 	}
 	fi, _ := os.Stat(out)

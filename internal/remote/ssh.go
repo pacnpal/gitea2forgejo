@@ -213,23 +213,17 @@ func (c *Client) ReadFile(path string) ([]byte, error) {
 	return io.ReadAll(f)
 }
 
-// FetchFile downloads remotePath to localPath.
-//
-// Fast path: if remotePath is also accessible via the local filesystem
-// (tool running on the same box as source, Unraid/homelab case), skip
-// SFTP entirely and use a hard link (instant, same filesystem) or a
-// local byte-copy (seconds, across filesystems). Avoids the SFTP
-// encryption + chunking overhead for a loop-to-self transfer.
-//
-// Slow path: real SSH-over-the-wire fetch with 5-second progress lines
-// for long-running transfers.
-func (c *Client) FetchFile(remotePath, localPath string) error {
+// FetchFile downloads remotePath to localPath and returns how the
+// transfer was satisfied. When the result is ResultSymlinked the caller
+// MUST NOT delete the source file while localPath is still in use, or
+// the symlink becomes dangling.
+func (c *Client) FetchFile(remotePath, localPath string) (LocalFetchResult, error) {
 	if fi, err := os.Stat(remotePath); err == nil && !fi.IsDir() {
 		return localFetch(remotePath, localPath, fi)
 	}
 	src, err := c.sftp.Open(remotePath)
 	if err != nil {
-		return fmt.Errorf("open remote %s: %w", remotePath, err)
+		return ResultRemote, fmt.Errorf("open remote %s: %w", remotePath, err)
 	}
 	defer src.Close()
 	var total int64
@@ -238,69 +232,87 @@ func (c *Client) FetchFile(remotePath, localPath string) error {
 	}
 	dst, err := os.Create(localPath)
 	if err != nil {
-		return fmt.Errorf("create local %s: %w", localPath, err)
+		return ResultRemote, fmt.Errorf("create local %s: %w", localPath, err)
 	}
 	defer dst.Close()
 	pr := newProgressReporter(remotePath, total)
 	defer pr.done()
 	if _, err := io.Copy(io.MultiWriter(dst, pr), src); err != nil {
-		return fmt.Errorf("copy: %w", err)
+		return ResultRemote, fmt.Errorf("copy: %w", err)
 	}
-	return nil
+	return ResultRemote, nil
 }
 
+// LocalFetchResult describes how FetchFile satisfied a same-host transfer.
+// Callers use ResultSymlinked / ResultHardLinked to decide whether
+// deleting the source file is safe — hard links keep the inode alive;
+// symlinks break.
+type LocalFetchResult int
+
+const (
+	ResultCopied     LocalFetchResult = iota // bytes were actually moved
+	ResultHardLinked                         // new directory entry, same inode
+	ResultSymlinked                          // new symlink; source must NOT be deleted
+	ResultRemote                             // SFTP was used (truly remote source)
+)
+
 // localFetch is the fast path when the "remote" file is visible on the
-// local filesystem. Three tiers, each faster than the SFTP path:
+// local filesystem. Four tiers, each faster than the SFTP path:
 //
-//  1. os.Link — same filesystem, O(1). Zero bytes transferred.
-//  2. cp --reflink=auto — same-fs reflink on XFS/btrfs/ZFS (instant
-//     COW clone); else falls through to a regular copy done by the
-//     OS-provided cp, which knows about sparse files + ioctl tricks.
-//  3. Native io.Copy with a PURE io.Reader / io.Writer pair so Go's
-//     os.File.ReadFrom can engage sendfile(2) on Linux. Progress is
-//     tracked by a separate goroutine that periodically stats dst,
-//     which avoids wrapping the writer with a counter (the wrapping
-//     was what defeated sendfile in the previous implementation).
-func localFetch(src, dst string, fi os.FileInfo) error {
-	_ = os.Remove(dst) // Link/Create fails if dst exists.
+//  1. os.Link — same filesystem, O(1). Zero bytes transferred. Source
+//     can safely be deleted afterwards (inode survives via our link).
+//  2. os.Symlink — cross filesystem, O(1). Zero bytes transferred.
+//     The source file is kept in place and must NOT be cleaned up
+//     while the symlink is in use. Caller is informed via the returned
+//     LocalFetchResult so downstream cleanup can be suppressed.
+//  3. cp --reflink=auto — same-fs reflink on XFS/btrfs/ZFS (instant
+//     COW clone); else kernel-optimized copy.
+//  4. Native io.Copy with a PURE io.Reader / io.Writer pair so Go's
+//     os.File.ReadFrom can engage sendfile(2) on Linux.
+func localFetch(src, dst string, fi os.FileInfo) (LocalFetchResult, error) {
+	_ = os.Remove(dst) // Link/Symlink/Create fail if dst exists.
 
 	// Tier 1: hard link.
 	if err := os.Link(src, dst); err == nil {
 		fmt.Fprintf(os.Stderr, "  local fast-path: hard-linked %s (%d MiB, zero copy)\n",
 			src, fi.Size()/(1<<20))
-		return nil
+		return ResultHardLinked, nil
 	}
 
-	// Tier 2: cp --reflink=auto. Handles same-fs reflinks AND does a
-	// regular copy otherwise (still kernel-optimized — better than
-	// naive userspace loops for cross-fs Unraid /mnt/user → /mnt/diskN).
+	// Tier 2: cross-filesystem symlink. Avoids any byte transfer when
+	// hard link fails because of EXDEV (common on Unraid shfs ↔ XFS
+	// disks, btrfs subvolumes, etc.). Caller MUST NOT delete the source.
+	if err := os.Symlink(src, dst); err == nil {
+		fmt.Fprintf(os.Stderr,
+			"  local fast-path: symlinked → %s (%d MiB, zero copy)\n",
+			src, fi.Size()/(1<<20))
+		return ResultSymlinked, nil
+	}
+
+	// Tier 3: cp --reflink=auto.
 	if cpPath, err := exec.LookPath("cp"); err == nil {
 		fmt.Fprintf(os.Stderr, "  local fast-path: cp --reflink=auto %s (%d MiB)\n",
 			src, fi.Size()/(1<<20))
 		cmd := exec.Command(cpPath, "--reflink=auto", "--preserve=timestamps", src, dst)
-		// Stream stderr from cp so the operator sees any EIO / ENOSPC.
 		cmd.Stderr = os.Stderr
-		// Progress tracker polls the destination file size every 5s.
 		stop := startSizePoller(dst, fi.Size())
 		err := cmd.Run()
 		close(stop)
 		if err == nil {
-			return nil
+			return ResultCopied, nil
 		}
-		// cp failed (unusual); fall through to pure-Go copy.
 		fmt.Fprintf(os.Stderr, "  cp failed (%v); falling back to io.Copy\n", err)
 	}
 
-	// Tier 3: pure Go copy. io.Copy(*os.File, *os.File) uses sendfile(2)
-	// on Linux because os.File satisfies io.ReaderFrom. No MultiWriter.
+	// Tier 4: pure Go copy with sendfile(2).
 	in, err := os.Open(src)
 	if err != nil {
-		return fmt.Errorf("open local %s: %w", src, err)
+		return ResultCopied, fmt.Errorf("open local %s: %w", src, err)
 	}
 	defer in.Close()
 	out, err := os.Create(dst)
 	if err != nil {
-		return fmt.Errorf("create local %s: %w", dst, err)
+		return ResultCopied, fmt.Errorf("create local %s: %w", dst, err)
 	}
 	defer out.Close()
 
@@ -309,9 +321,9 @@ func localFetch(src, dst string, fi os.FileInfo) error {
 	stop := startSizePoller(dst, fi.Size())
 	defer close(stop)
 	if _, err := io.Copy(out, in); err != nil {
-		return fmt.Errorf("local copy: %w", err)
+		return ResultCopied, fmt.Errorf("local copy: %w", err)
 	}
-	return nil
+	return ResultCopied, nil
 }
 
 // startSizePoller logs destination file size every 5 seconds until close()d.

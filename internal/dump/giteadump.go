@@ -73,7 +73,8 @@ func giteaDumpBareMetal(cfg *config.Config, cli *remote.Client, log *slog.Logger
 	localPath := filepath.Join(cfg.WorkDir, "gitea-dump."+ext)
 	log.Info("fetching dump from host", "from", remotePath, "to", localPath)
 	fetchStart := time.Now()
-	if err := cli.FetchFile(remotePath, localPath); err != nil {
+	result, err := cli.FetchFile(remotePath, localPath)
+	if err != nil {
 		return "", fmt.Errorf("fetch dump: %w", err)
 	}
 	if fi, err := os.Stat(localPath); err == nil {
@@ -81,7 +82,16 @@ func giteaDumpBareMetal(cfg *config.Config, cli *remote.Client, log *slog.Logger
 			"size_bytes", fi.Size(),
 			"elapsed", time.Since(fetchStart).Round(time.Second))
 	}
-	_, _ = cli.Run("rm -f " + shQuote(remotePath))
+	// Only remove the source when our local copy is independent of it
+	// (SFTP download, hard link, or byte copy). A symlink into work_dir
+	// would become dangling if we removed the source.
+	if result != remote.ResultSymlinked {
+		_, _ = cli.Run("rm -f " + shQuote(remotePath))
+	} else {
+		log.Info("source dump kept in place (symlinked into work_dir)",
+			"path", remotePath,
+			"note", "remove manually after migration: rm -f "+remotePath)
+	}
 	return localPath, nil
 }
 
@@ -186,7 +196,8 @@ func giteaDumpDocker(cfg *config.Config, cli *remote.Client, log *slog.Logger) (
 	localPath := filepath.Join(cfg.WorkDir, "gitea-dump."+ext)
 	log.Info("fetching dump from host", "from", hostFile, "to", localPath)
 	fetchStart := time.Now()
-	if err := cli.FetchFile(hostFile, localPath); err != nil {
+	result, err := cli.FetchFile(hostFile, localPath)
+	if err != nil {
 		return "", fmt.Errorf("fetch dump from %s: %w", hostFile, err)
 	}
 	if fi, err := os.Stat(localPath); err == nil {
@@ -195,13 +206,21 @@ func giteaDumpDocker(cfg *config.Config, cli *remote.Client, log *slog.Logger) (
 			"elapsed", time.Since(fetchStart).Round(time.Second))
 	}
 
-	// Cleanup. Remove the container-side scratch (which also clears the
-	// host side when bind-mounted). When we used docker cp, also remove
-	// the host tempfile.
-	_, _ = cli.Run(fmt.Sprintf("%s exec %s rm -rf %s",
-		shQuote(orDefault(d.Binary, "docker")), shQuote(d.Container), shQuote(containerWork)))
-	if needsDockerCp {
-		_, _ = cli.Run("rm -f " + shQuote(hostFile))
+	// Cleanup: remove the container-side scratch (which clears the host
+	// side via the bind mount). Skip when we symlinked — deleting the
+	// source would dangle the link. In that case inform the operator so
+	// they can clean up when the migration is done.
+	if result == remote.ResultSymlinked {
+		log.Info("source dump kept in place (symlinked into work_dir)",
+			"path", hostFile,
+			"cleanup_after_migration",
+			fmt.Sprintf("docker exec %s rm -rf %s", d.Container, containerWork))
+	} else {
+		_, _ = cli.Run(fmt.Sprintf("%s exec %s rm -rf %s",
+			shQuote(orDefault(d.Binary, "docker")), shQuote(d.Container), shQuote(containerWork)))
+		if needsDockerCp {
+			_, _ = cli.Run("rm -f " + shQuote(hostFile))
+		}
 	}
 	return localPath, nil
 }
