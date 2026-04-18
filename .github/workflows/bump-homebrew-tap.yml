@@ -125,6 +125,13 @@ jobs:
               bin.install "gitea2forgejo-#{platform}" => "gitea2forgejo"
             end
 
+            def post_install
+              return unless OS.mac?
+              binary = bin/"gitea2forgejo"
+              system "/usr/bin/xattr", "-dr", "com.apple.quarantine", binary
+              system "/usr/bin/codesign", "--force", "--sign", "-", binary
+            end
+
             test do
               assert_match(/gitea2forgejo/, shell_output("#{bin}/gitea2forgejo --version"))
             end
