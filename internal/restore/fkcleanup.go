@@ -31,6 +31,15 @@ func CleanOrphanFKs(cfg *config.Config, log *slog.Logger) error {
 
 	userTable := quoteUserTable(cfg.Target.DB.Dialect)
 
+	// `owner_id = 0` and `repo_id = 0` are Gitea's "no owner" / "no repo"
+	// convention for global tokens. Forgejo v15's FKs are strict though
+	// — any value not in user.id / repository.id fails, including 0
+	// (there's no user/repo with id=0). v0.2.23's "!= 0" exclusion
+	// missed exactly those rows and the migration still crashed. Runner
+	// tokens are session-like and must be re-registered after any
+	// migration (already in the post-restore checklist), so the only
+	// safe answer is to remove every row whose FK target doesn't
+	// resolve, 0 included.
 	stmts := []struct {
 		label string
 		sql   string
@@ -38,12 +47,12 @@ func CleanOrphanFKs(cfg *config.Config, log *slog.Logger) error {
 		{
 			label: "action_runner_token.owner_id → user",
 			sql: fmt.Sprintf(
-				`DELETE FROM action_runner_token WHERE owner_id != 0 AND owner_id NOT IN (SELECT id FROM %s)`,
+				`DELETE FROM action_runner_token WHERE owner_id NOT IN (SELECT id FROM %s)`,
 				userTable),
 		},
 		{
 			label: "action_runner_token.repo_id → repository",
-			sql:   `DELETE FROM action_runner_token WHERE repo_id != 0 AND repo_id NOT IN (SELECT id FROM repository)`,
+			sql:   `DELETE FROM action_runner_token WHERE repo_id NOT IN (SELECT id FROM repository)`,
 		},
 	}
 
