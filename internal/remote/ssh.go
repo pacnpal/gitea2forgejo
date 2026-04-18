@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"os/exec"
 	"strconv"
 	"strings"
 	"time"
@@ -249,17 +250,49 @@ func (c *Client) FetchFile(remotePath, localPath string) error {
 }
 
 // localFetch is the fast path when the "remote" file is visible on the
-// local filesystem. Tries os.Link first (same filesystem = O(1)) and
-// falls back to a local byte copy (ENOEXDEV = cross-filesystem).
+// local filesystem. Three tiers, each faster than the SFTP path:
+//
+//  1. os.Link — same filesystem, O(1). Zero bytes transferred.
+//  2. cp --reflink=auto — same-fs reflink on XFS/btrfs/ZFS (instant
+//     COW clone); else falls through to a regular copy done by the
+//     OS-provided cp, which knows about sparse files + ioctl tricks.
+//  3. Native io.Copy with a PURE io.Reader / io.Writer pair so Go's
+//     os.File.ReadFrom can engage sendfile(2) on Linux. Progress is
+//     tracked by a separate goroutine that periodically stats dst,
+//     which avoids wrapping the writer with a counter (the wrapping
+//     was what defeated sendfile in the previous implementation).
 func localFetch(src, dst string, fi os.FileInfo) error {
-	_ = os.Remove(dst) // Link fails if dst exists.
+	_ = os.Remove(dst) // Link/Create fails if dst exists.
+
+	// Tier 1: hard link.
 	if err := os.Link(src, dst); err == nil {
-		fmt.Fprintf(os.Stderr, "  fetch %s: hard-linked (%d MB)\n", src, fi.Size()/(1<<20))
+		fmt.Fprintf(os.Stderr, "  local fast-path: hard-linked %s (%d MiB, zero copy)\n",
+			src, fi.Size()/(1<<20))
 		return nil
 	}
-	// Hard link failed — probably cross-filesystem. Fall back to a
-	// streaming byte copy (still faster than SFTP because no
-	// encryption/chunking overhead).
+
+	// Tier 2: cp --reflink=auto. Handles same-fs reflinks AND does a
+	// regular copy otherwise (still kernel-optimized — better than
+	// naive userspace loops for cross-fs Unraid /mnt/user → /mnt/diskN).
+	if cpPath, err := exec.LookPath("cp"); err == nil {
+		fmt.Fprintf(os.Stderr, "  local fast-path: cp --reflink=auto %s (%d MiB)\n",
+			src, fi.Size()/(1<<20))
+		cmd := exec.Command(cpPath, "--reflink=auto", "--preserve=timestamps", src, dst)
+		// Stream stderr from cp so the operator sees any EIO / ENOSPC.
+		cmd.Stderr = os.Stderr
+		// Progress tracker polls the destination file size every 5s.
+		stop := startSizePoller(dst, fi.Size())
+		err := cmd.Run()
+		close(stop)
+		if err == nil {
+			return nil
+		}
+		// cp failed (unusual); fall through to pure-Go copy.
+		fmt.Fprintf(os.Stderr, "  cp failed (%v); falling back to io.Copy\n", err)
+	}
+
+	// Tier 3: pure Go copy. io.Copy(*os.File, *os.File) uses sendfile(2)
+	// on Linux because os.File satisfies io.ReaderFrom. No MultiWriter.
 	in, err := os.Open(src)
 	if err != nil {
 		return fmt.Errorf("open local %s: %w", src, err)
@@ -270,12 +303,49 @@ func localFetch(src, dst string, fi os.FileInfo) error {
 		return fmt.Errorf("create local %s: %w", dst, err)
 	}
 	defer out.Close()
-	pr := newProgressReporter(src, fi.Size())
-	defer pr.done()
-	if _, err := io.Copy(io.MultiWriter(out, pr), in); err != nil {
+
+	fmt.Fprintf(os.Stderr, "  local fast-path: io.Copy with sendfile %s (%d MiB)\n",
+		src, fi.Size()/(1<<20))
+	stop := startSizePoller(dst, fi.Size())
+	defer close(stop)
+	if _, err := io.Copy(out, in); err != nil {
 		return fmt.Errorf("local copy: %w", err)
 	}
 	return nil
+}
+
+// startSizePoller logs destination file size every 5 seconds until close()d.
+// Used when the copy engine is out of our reach (shelled cp) or when
+// wrapping the writer would disable sendfile.
+func startSizePoller(dst string, total int64) chan<- struct{} {
+	stop := make(chan struct{})
+	go func() {
+		start := time.Now()
+		tick := time.NewTicker(5 * time.Second)
+		defer tick.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-tick.C:
+				fi, err := os.Stat(dst)
+				if err != nil {
+					continue
+				}
+				seen := fi.Size()
+				rate := float64(seen) / time.Since(start).Seconds() / (1 << 20)
+				if total > 0 {
+					pct := float64(seen) * 100 / float64(total)
+					fmt.Fprintf(os.Stderr, "  copy progress: %.1f%% (%d / %d MiB, avg %.1f MiB/s)\n",
+						pct, seen/(1<<20), total/(1<<20), rate)
+				} else {
+					fmt.Fprintf(os.Stderr, "  copy progress: %d MiB (avg %.1f MiB/s)\n",
+						seen/(1<<20), rate)
+				}
+			}
+		}
+	}()
+	return stop
 }
 
 // progressReporter is a minimal writer that counts bytes and periodically
