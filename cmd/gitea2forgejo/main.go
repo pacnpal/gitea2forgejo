@@ -19,6 +19,7 @@ import (
 	"github.com/pacnpal/gitea2forgejo/internal/initcmd"
 	"github.com/pacnpal/gitea2forgejo/internal/preflight"
 	"github.com/pacnpal/gitea2forgejo/internal/restore"
+	"github.com/pacnpal/gitea2forgejo/internal/verifydump"
 )
 
 // Injected at build time via -ldflags -X. See .slsa-goreleaser.yml.
@@ -58,6 +59,7 @@ func main() {
 	root.AddCommand(newInitCmd())
 	root.AddCommand(newPreflightCmd())
 	root.AddCommand(newDumpCmd())
+	root.AddCommand(newVerifyDumpCmd())
 	root.AddCommand(newRestoreCmd())
 
 	if err := root.Execute(); err != nil {
@@ -278,6 +280,53 @@ Individual stages can be skipped via options.skip_* in config.`,
 			}
 			log.Info("dump: starting", "source", cfg.Source.URL, "work_dir", cfg.WorkDir)
 			return dump.Run(cfg, log)
+		},
+	}
+}
+
+func newVerifyDumpCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "verify-dump",
+		Short: "Sanity-check the dump artifacts in work_dir before restore",
+		Long: `Read-only checks of the dump produced by 'gitea2forgejo dump':
+
+  * source-manifest.json is parseable and non-empty
+  * gitea-dump.tar.zst (or .tar.gz/.tar/.zip) is listable
+  * tarball contains the expected top-level members
+    (app.ini, custom/, data/, repos/, gitea-db.sql)
+  * per-owner repo count in the tarball matches manifest.Repos
+  * native DB dump exists and passes a format smoke test
+    (pg_restore --list / SQLite magic / mysqldump header)
+  * s3/ mirror directory present when S3 storage is configured
+
+Emits work_dir/verify-dump-report.md with a go/no-go decision.
+Exit non-zero when any check is FAIL so this can gate a CI pipeline.`,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := loadConfig()
+			if err != nil {
+				return err
+			}
+			log.Info("verify-dump: starting", "work_dir", cfg.WorkDir)
+			res := verifydump.Run(cfg, log)
+			path, err := res.WriteReport(cfg.WorkDir)
+			if err != nil {
+				return fmt.Errorf("write report: %w", err)
+			}
+			for _, c := range res.Checks {
+				switch c.Status {
+				case "FAIL":
+					log.Error("check FAIL", "name", c.Name, "detail", c.Detail)
+				case "WARN":
+					log.Warn("check WARN", "name", c.Name, "detail", c.Detail)
+				default:
+					log.Info("check PASS", "name", c.Name, "detail", c.Detail)
+				}
+			}
+			fmt.Fprintf(os.Stderr, "\nReport: %s\n", path)
+			if res.HardFails > 0 {
+				return fmt.Errorf("verify-dump: %d hard fails", res.HardFails)
+			}
+			return nil
 		},
 	}
 }
