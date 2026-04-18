@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"time"
 
 	"github.com/pacnpal/gitea2forgejo/internal/config"
 	"github.com/pacnpal/gitea2forgejo/internal/remote"
@@ -31,16 +32,39 @@ func ensureTargetMounts(ssh *remote.Client, cfg *config.Config, log *slog.Logger
 	if bin == "" {
 		bin = "docker"
 	}
-	out, err := ssh.Run(fmt.Sprintf(
+	inspectCmd := fmt.Sprintf(
 		"%s inspect --format '{{range .Mounts}}{{.Source}}\t{{.Destination}}\n{{end}}' %s",
-		shQuote(bin), shQuote(d.Container)))
-	if err != nil {
-		return fmt.Errorf("docker inspect mounts: %w (%s)", err, string(out))
+		shQuote(bin), shQuote(d.Container))
+
+	// A previous restore may have just `docker start`ed this container;
+	// if Forgejo crashed immediately after boot the container can be
+	// in a transient "restarting" / "removing" / stopping state where
+	// `docker inspect` returns metadata without the .Mounts field
+	// populated. Retry with a short delay before declaring the mount
+	// list truly empty.
+	var lastOut string
+	var mounts []config.Mount
+	for attempt := 1; attempt <= 3; attempt++ {
+		if attempt > 1 {
+			time.Sleep(2 * time.Second)
+		}
+		out, err := ssh.Run(inspectCmd)
+		if err != nil {
+			return fmt.Errorf("docker inspect mounts: %w (%s)", err, string(out))
+		}
+		lastOut = string(out)
+		mounts = parseDockerMounts(lastOut)
+		if len(mounts) > 0 {
+			break
+		}
+		log.Warn("docker inspect returned no bind mounts; retrying",
+			"container", d.Container, "attempt", attempt, "raw", strings.TrimSpace(lastOut))
 	}
-	d.Mounts = append(d.Mounts, parseDockerMounts(string(out))...)
-	if len(d.Mounts) == 0 {
-		return fmt.Errorf("docker inspect %q returned no bind mounts — is the container running?", d.Container)
+	if len(mounts) == 0 {
+		return fmt.Errorf("docker inspect %q returned no bind mounts after 3 attempts — container may be in a transient state; try `docker start %s` then re-run (raw inspect output: %q)",
+			d.Container, d.Container, strings.TrimSpace(lastOut))
 	}
+	d.Mounts = append(d.Mounts, mounts...)
 	log.Info("discovered docker mounts for target container",
 		"container", d.Container, "count", len(d.Mounts))
 	return nil
