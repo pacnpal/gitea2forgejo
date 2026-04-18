@@ -105,6 +105,14 @@ func Run(cfg *config.Config, log *slog.Logger) error {
 	log.Info("waiting 10s for Forgejo to finish forward migrations")
 	waitSeconds(10)
 
+	// Re-chown inside the running container to catch anything the
+	// s6-overlay init created during startup (most commonly
+	// /data/gitea/log as root). doctor / regenerate-hooks run as git
+	// and would otherwise hit "permission denied" on the log dir.
+	if err := ChownInContainer(ssh, cfg, log); err != nil {
+		log.Warn("post-start chown failed (continuing — doctor may report permission errors)", "err", err)
+	}
+
 	if err := Doctor(ssh, cfg, log); err != nil {
 		log.Warn("doctor reported issues", "err", err)
 	}

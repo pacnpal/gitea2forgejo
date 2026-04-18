@@ -125,22 +125,36 @@ func applyRewrites(f *ini.File, cfg *config.Config, log *slog.Logger) error {
 
 	// Path rewrites: if source data_dir differs from target data_dir, swap
 	// references in any section that has a PATH or ROOT key.
-	if cfg.Source.DataDir != "" && cfg.Target.DataDir != "" && cfg.Source.DataDir != cfg.Target.DataDir {
+	//
+	// For Docker targets the rewritten paths have to be the CONTAINER-
+	// side paths — Forgejo reads app.ini inside the container and can't
+	// resolve host paths like /mnt/user/appdata/forgejo/... There's the
+	// symmetric concern for Docker sources: the source app.ini we're
+	// mutating contains whatever paths Gitea was actually configured
+	// with, which for container sources are usually /data/... — so we
+	// also translate cfg.Source.DataDir / RepoRoot to the source's
+	// container path when matching.
+	srcDataDir := sourcePathForAppIni(cfg, cfg.Source.DataDir)
+	tgtDataDir := targetPathForAppIni(cfg, cfg.Target.DataDir)
+	srcRepoRoot := sourcePathForAppIni(cfg, cfg.Source.RepoRoot)
+	tgtRepoRoot := targetPathForAppIni(cfg, cfg.Target.RepoRoot)
+
+	if srcDataDir != "" && tgtDataDir != "" && srcDataDir != tgtDataDir {
 		log.Info("rewriting data_dir references",
-			"from", cfg.Source.DataDir, "to", cfg.Target.DataDir)
+			"from", srcDataDir, "to", tgtDataDir)
 		for _, sec := range f.Sections() {
 			for _, key := range sec.Keys() {
 				v := key.Value()
-				if containsPath(v, cfg.Source.DataDir) {
-					key.SetValue(replaceFirst(v, cfg.Source.DataDir, cfg.Target.DataDir))
+				if containsPath(v, srcDataDir) {
+					key.SetValue(replaceFirst(v, srcDataDir, tgtDataDir))
 				}
 			}
 		}
 	}
-	if cfg.Source.RepoRoot != "" && cfg.Target.RepoRoot != "" && cfg.Source.RepoRoot != cfg.Target.RepoRoot {
+	if srcRepoRoot != "" && tgtRepoRoot != "" && srcRepoRoot != tgtRepoRoot {
 		if rec, err := f.GetSection("repository"); err == nil {
 			if k, err := rec.GetKey("ROOT"); err == nil {
-				k.SetValue(cfg.Target.RepoRoot)
+				k.SetValue(tgtRepoRoot)
 			}
 		}
 	}
@@ -150,6 +164,38 @@ func applyRewrites(f *ini.File, cfg *config.Config, log *slog.Logger) error {
 	// them here because that breaks every encrypted column in the DB.
 
 	return nil
+}
+
+// sourcePathForAppIni returns the path that should match against the
+// source app.ini's contents for a given cfg.Source.* value. The source
+// app.ini carries whatever paths Gitea was actually running with:
+// container paths for Docker sources, host paths for bare-metal.
+func sourcePathForAppIni(cfg *config.Config, hostPath string) string {
+	if hostPath == "" {
+		return ""
+	}
+	if cfg.Source.Docker != nil && cfg.Source.Docker.Container != "" {
+		if cp := cfg.Source.Docker.HostToContainer(hostPath); cp != "" {
+			return cp
+		}
+	}
+	return hostPath
+}
+
+// targetPathForAppIni returns the path that should be written into the
+// TARGET app.ini. For Docker targets that's the container-side path
+// (Forgejo reads app.ini inside the container); for bare-metal the
+// host path is fine.
+func targetPathForAppIni(cfg *config.Config, hostPath string) string {
+	if hostPath == "" {
+		return ""
+	}
+	if cfg.Target.Docker != nil && cfg.Target.Docker.Container != "" {
+		if cp := cfg.Target.Docker.HostToContainer(hostPath); cp != "" {
+			return cp
+		}
+	}
+	return hostPath
 }
 
 func setIfPresent(sec *ini.Section, key, value string) {

@@ -363,6 +363,56 @@ func orDefaultStr(v, d string) string {
 	return v
 }
 
+// ChownInContainer re-runs chown through `docker exec -u 0` against the
+// already-started Forgejo container. The pre-start sidecar chown
+// (chownViaDocker) gets everything that exists on disk before boot,
+// but Forgejo's s6-overlay init can create fresh files during startup
+// (most commonly /data/gitea/log) as root — leaving doctor unable to
+// write because it runs as git. Running chown from inside the live
+// container as uid 0 catches those post-boot additions.
+//
+// No-op on bare-metal targets; Chown() already did the host-side work.
+func ChownInContainer(ssh *remote.Client, cfg *config.Config, log *slog.Logger) error {
+	d := cfg.Target.Docker
+	if d == nil || d.Container == "" {
+		return nil
+	}
+	bin := orDefaultStr(d.Binary, "docker")
+	user := orDefaultStr(d.User, "git")
+	spec := user + ":" + user
+
+	var dirs []string
+	for _, hostDir := range []string{cfg.Target.DataDir, cfg.Target.RepoRoot, cfg.Target.CustomDir} {
+		if hostDir == "" {
+			continue
+		}
+		cont := d.HostToContainer(hostDir)
+		if cont == "" {
+			continue
+		}
+		dirs = append(dirs, cont)
+	}
+	if len(dirs) == 0 {
+		return nil
+	}
+
+	// sh -c … so the exec runs chown against each dir with && short-
+	// circuit, stopping on the first failure with a clear error. -u 0
+	// forces root inside the container regardless of the image's USER.
+	var paths []string
+	for _, d := range dirs {
+		paths = append(paths, shQuote(d))
+	}
+	inner := fmt.Sprintf("chown -R %s %s", shQuote(spec), strings.Join(paths, " "))
+	cmd := fmt.Sprintf("%s exec -u 0 %s sh -c %s",
+		shQuote(bin), shQuote(d.Container), shQuote(inner))
+	log.Info("chown (docker exec post-start)", "dirs", dirs, "owner", spec)
+	if out, err := ssh.Run(cmd); err != nil {
+		return fmt.Errorf("post-start chown: %w (%s)", err, string(out))
+	}
+	return nil
+}
+
 // Chown flips ownership of the target data tree to the Forgejo user.
 //
 // Two paths:
