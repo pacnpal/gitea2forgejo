@@ -56,39 +56,83 @@ func ExtractDump(cfg *config.Config, log *slog.Logger) (string, error) {
 	return outDir, runCmd(cmd, log, "tar")
 }
 
-// RsyncToTarget copies a local directory tree up to the target host via SSH.
-// `remoteDst` is the absolute path on the target.
+// RsyncToTarget copies a local directory tree to the target path. When
+// the target directory is reachable on the mig-host's local filesystem
+// (sameHost check: we can stat the target directory directly), the
+// rsync invocation drops the SSH transport entirely and runs locally
+// — significantly faster for loopback / Unraid / homelab use.
 //
-// It shells out to rsync because rsync handles large trees with hardlinks,
-// sparse files, and transient failures far better than any Go-native copy.
+// remoteDst is the absolute path on the target, which for same-host
+// runs is ALSO a path on our local filesystem.
 func RsyncToTarget(cfg *config.Config, localSrc, remoteDst string, log *slog.Logger) error {
 	if _, err := os.Stat(localSrc); err != nil {
 		log.Info("rsync: source missing, skipping", "src", localSrc)
 		return nil
 	}
-	if cfg.Target.SSH == nil {
-		return fmt.Errorf("rsync requires target.ssh block")
+
+	local := isLocalPath(remoteDst)
+	var args []string
+	var dstDesc string
+	if local {
+		args = []string{
+			"-aHAX",
+			"--delete-after",
+			"--numeric-ids",
+			"--info=progress2",
+			ensureTrailingSlash(localSrc),
+			ensureTrailingSlash(remoteDst),
+		}
+		dstDesc = remoteDst
+	} else {
+		if cfg.Target.SSH == nil {
+			return fmt.Errorf("rsync requires target.ssh block for remote targets")
+		}
+		rspec := fmt.Sprintf("%s@%s:%s", cfg.Target.SSH.User, cfg.Target.SSH.Host, remoteDst)
+		sshCmd := fmt.Sprintf("ssh -p %d -i %s -o StrictHostKeyChecking=no",
+			cfg.Target.SSH.Port, cfg.Target.SSH.Key)
+		args = []string{
+			"-aHAX",
+			"--delete-after",
+			"--numeric-ids",
+			"--info=progress2",
+			"-e", sshCmd,
+			ensureTrailingSlash(localSrc),
+			rspec,
+		}
+		dstDesc = rspec
 	}
-	rspec := fmt.Sprintf("%s@%s:%s", cfg.Target.SSH.User, cfg.Target.SSH.Host, remoteDst)
-	sshCmd := fmt.Sprintf("ssh -p %d -i %s -o StrictHostKeyChecking=no",
-		cfg.Target.SSH.Port, cfg.Target.SSH.Key)
-	args := []string{
-		"-aHAX",           // archive + hardlinks + ACLs + xattrs
-		"--delete-after",  // mirror (remove target-only files after transfer)
-		"--numeric-ids",
-		"--info=progress2",
-		"-e", sshCmd,
-		ensureTrailingSlash(localSrc),
-		rspec,
-	}
+
 	cmd := exec.Command("rsync", args...)
-	log.Info("rsync: starting", "src", localSrc, "dst", rspec)
+	log.Info("rsync: starting", "src", localSrc, "dst", dstDesc, "local_fast_path", local)
 	start := time.Now()
 	if err := runCmd(cmd, log, "rsync"); err != nil {
-		return fmt.Errorf("rsync %s -> %s: %w", localSrc, rspec, err)
+		return fmt.Errorf("rsync %s -> %s: %w", localSrc, dstDesc, err)
 	}
 	log.Info("rsync: done", "elapsed", time.Since(start).Round(time.Second))
 	return nil
+}
+
+// isLocalPath returns true when the given absolute path (or its parent
+// dir) is reachable via the local filesystem. Used to detect the
+// loopback case where we can skip SSH entirely.
+func isLocalPath(p string) bool {
+	if p == "" {
+		return false
+	}
+	if _, err := os.Stat(p); err == nil {
+		return true
+	}
+	// Path may not exist yet (fresh target dir). Walk up to the first
+	// extant ancestor and test there.
+	for cur := filepath.Dir(p); cur != "" && cur != "."; cur = filepath.Dir(cur) {
+		if _, err := os.Stat(cur); err == nil {
+			return true
+		}
+		if cur == "/" {
+			break
+		}
+	}
+	return false
 }
 
 // StageFiles extracts the dump and rsyncs its data/repos/custom subtrees to
@@ -119,9 +163,23 @@ func StageFiles(cfg *config.Config, log *slog.Logger) error {
 	return nil
 }
 
-// StopService and StartService operate the Forgejo systemd unit on the target.
-func StopService(ssh *remote.Client, log *slog.Logger) error {
-	log.Info("target: stopping forgejo service")
+// StopService stops the target Forgejo. Docker targets use `docker stop
+// <container>`; bare-metal targets use `systemctl stop forgejo`. The
+// previous systemctl-only implementation exited 127 on hosts without
+// systemd (Unraid, Alpine, Docker-only VMs).
+func StopService(ssh *remote.Client, cfg *config.Config, log *slog.Logger) error {
+	if cfg.Target.Docker != nil && cfg.Target.Docker.Container != "" {
+		log.Info("target: stopping forgejo container", "container", cfg.Target.Docker.Container)
+		cmd := fmt.Sprintf("%s stop %s",
+			shQuote(orDefaultStr(cfg.Target.Docker.Binary, "docker")),
+			shQuote(cfg.Target.Docker.Container))
+		out, err := ssh.Run(cmd)
+		if err != nil {
+			return fmt.Errorf("docker stop: %w (%s)", err, string(out))
+		}
+		return nil
+	}
+	log.Info("target: stopping forgejo service (systemd)")
 	out, err := ssh.Run("systemctl stop forgejo")
 	if err != nil {
 		return fmt.Errorf("systemctl stop: %w (%s)", err, string(out))
@@ -129,13 +187,32 @@ func StopService(ssh *remote.Client, log *slog.Logger) error {
 	return nil
 }
 
-func StartService(ssh *remote.Client, log *slog.Logger) error {
-	log.Info("target: starting forgejo service")
+// StartService is the inverse of StopService.
+func StartService(ssh *remote.Client, cfg *config.Config, log *slog.Logger) error {
+	if cfg.Target.Docker != nil && cfg.Target.Docker.Container != "" {
+		log.Info("target: starting forgejo container", "container", cfg.Target.Docker.Container)
+		cmd := fmt.Sprintf("%s start %s",
+			shQuote(orDefaultStr(cfg.Target.Docker.Binary, "docker")),
+			shQuote(cfg.Target.Docker.Container))
+		out, err := ssh.Run(cmd)
+		if err != nil {
+			return fmt.Errorf("docker start: %w (%s)", err, string(out))
+		}
+		return nil
+	}
+	log.Info("target: starting forgejo service (systemd)")
 	out, err := ssh.Run("systemctl start forgejo")
 	if err != nil {
 		return fmt.Errorf("systemctl start: %w (%s)", err, string(out))
 	}
 	return nil
+}
+
+func orDefaultStr(v, d string) string {
+	if v == "" {
+		return d
+	}
+	return v
 }
 
 // Chown flips ownership of the target data tree to the forgejo user.

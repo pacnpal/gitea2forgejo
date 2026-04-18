@@ -34,7 +34,7 @@ func Run(cfg *config.Config, log *slog.Logger) error {
 	}
 	defer ssh.Close()
 
-	if err := StopService(ssh, log); err != nil {
+	if err := StopService(ssh, cfg, log); err != nil {
 		log.Warn("stop forgejo failed (continuing — may already be stopped)", "err", err)
 	}
 
@@ -82,7 +82,7 @@ func Run(cfg *config.Config, log *slog.Logger) error {
 	if err := Chown(ssh, cfg, log); err != nil {
 		return fmt.Errorf("chown: %w", err)
 	}
-	if err := StartService(ssh, log); err != nil {
+	if err := StartService(ssh, cfg, log); err != nil {
 		return fmt.Errorf("start forgejo: %w", err)
 	}
 	// Forgejo runs forward schema migrations at startup. Give it a moment
