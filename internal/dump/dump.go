@@ -26,6 +26,14 @@ func Run(cfg *config.Config, log *slog.Logger) error {
 		return fmt.Errorf("mkdir work_dir: %w", err)
 	}
 
+	// If a prior dump is sitting in work_dir, offer to reuse it
+	// (common when iterating on restore) or nuke it and regenerate.
+	action, err := checkExistingDump(cfg, log)
+	if err != nil {
+		return err
+	}
+	reuse := action == actionReuse
+
 	src, err := client.New(&cfg.Source, client.KindSource)
 	if err != nil {
 		return err
@@ -61,27 +69,36 @@ func Run(cfg *config.Config, log *slog.Logger) error {
 	log.Info("manifest written", "path", manifestPath)
 
 	// Stage 3: gitea dump.
-	if cfg.Options.SkipGiteaDump {
+	switch {
+	case cfg.Options.SkipGiteaDump:
 		log.Info("gitea dump: skipped by config")
-	} else {
+	case reuse:
+		log.Info("gitea dump: reusing existing tarball in work_dir")
+	default:
 		if _, err := GiteaDump(cfg, log); err != nil {
 			return fmt.Errorf("gitea dump: %w", err)
 		}
 	}
 
 	// Stage 4: native DB dump.
-	if cfg.Options.SkipNativeDB {
+	switch {
+	case cfg.Options.SkipNativeDB:
 		log.Info("native db dump: skipped by config")
-	} else {
+	case reuse:
+		log.Info("native db dump: reusing existing artifact in work_dir")
+	default:
 		if _, err := NativeDump(cfg, log); err != nil {
 			return fmt.Errorf("native db dump: %w", err)
 		}
 	}
 
 	// Stage 5: S3 mirror.
-	if cfg.Options.SkipS3Mirror {
+	switch {
+	case cfg.Options.SkipS3Mirror:
 		log.Info("s3 mirror: skipped by config")
-	} else {
+	case reuse:
+		log.Info("s3 mirror: reusing existing mirror in work_dir (if any)")
+	default:
 		if _, err := S3Mirror(cfg, log); err != nil {
 			return fmt.Errorf("s3 mirror: %w", err)
 		}

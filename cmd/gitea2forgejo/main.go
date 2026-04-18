@@ -18,6 +18,7 @@ import (
 	"github.com/spf13/cobra"
 	"golang.org/x/term"
 
+	"github.com/pacnpal/gitea2forgejo/internal/cleanup"
 	"github.com/pacnpal/gitea2forgejo/internal/config"
 	"github.com/pacnpal/gitea2forgejo/internal/dump"
 	"github.com/pacnpal/gitea2forgejo/internal/initcmd"
@@ -82,6 +83,7 @@ func main() {
 	root.AddCommand(newDumpCmd())
 	root.AddCommand(newVerifyDumpCmd())
 	root.AddCommand(newRestoreCmd())
+	root.AddCommand(newCleanupCmd())
 	root.AddCommand(newUpdateCmd())
 
 	if err := root.Execute(); err != nil {
@@ -92,6 +94,33 @@ func main() {
 
 func loadConfig() (*config.Config, error) {
 	return config.Load(configPath)
+}
+
+func newCleanupCmd() *cobra.Command {
+	opt := cleanup.Options{}
+	cmd := &cobra.Command{
+		Use:   "cleanup",
+		Short: "Remove dump artifacts from work_dir and the source host scratch",
+		Long: `Reclaims disk space after a successful migration.
+
+Removes local artifacts (gitea-dump.<ext> tarball or symlink,
+source-manifest.json, native DB dump, preflight / verify reports,
+extracted/, s3/ mirror), then follows any symlink in work_dir back
+to the source host's scratch directory and removes that too via
+docker exec (when source is containerized) or direct SSH rm (bare
+metal). Prompts for confirmation unless --force.`,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := loadConfig()
+			if err != nil {
+				return err
+			}
+			return cleanup.Run(cfg, opt, log)
+		},
+	}
+	cmd.Flags().BoolVar(&opt.Force, "force", false, "skip confirmation prompt")
+	cmd.Flags().BoolVar(&opt.KeepLocal, "keep-local", false, "only clean up the source host scratch, leave work_dir alone")
+	cmd.Flags().BoolVar(&opt.KeepRemote, "keep-remote", false, "only clean up work_dir, leave the source host scratch alone")
+	return cmd
 }
 
 func newUpdateCmd() *cobra.Command {
