@@ -440,14 +440,9 @@ func chownViaDocker(ssh *remote.Client, cfg *config.Config, log *slog.Logger) er
 	// does not. The inherited volumes land at the same paths the
 	// Forgejo container sees, so the container-side paths we already
 	// computed work verbatim.
-	imgOut, err := ssh.Run(fmt.Sprintf("%s inspect --format '{{.Config.Image}}' %s",
-		shQuote(bin), shQuote(d.Container)))
+	image, err := inspectContainerImage(ssh, bin, d.Container)
 	if err != nil {
-		return fmt.Errorf("inspect container image: %w (%s)", err, string(imgOut))
-	}
-	image := strings.TrimSpace(string(imgOut))
-	if image == "" {
-		return fmt.Errorf("container %q has no recorded image", d.Container)
+		return err
 	}
 
 	// Forgejo's official image ships USER 1000:1000 so its default
@@ -476,6 +471,53 @@ func chownViaDocker(ssh *remote.Client, cfg *config.Config, log *slog.Logger) er
 		return fmt.Errorf("chown via sidecar: %w (%s)", err, string(out))
 	}
 	return nil
+}
+
+// inspectContainerImage returns the image name for the named container.
+// Retries up to 3 times when the inspect output isn't printable ASCII:
+// an empty or binary response has been observed on some Unraid sshd +
+// docker combinations, sometimes after a failing test -d in the same
+// SSH multiplex. Letting null-padded bytes flow into `docker run`
+// produces an opaque EOF — re-running docker inspect is cheap and
+// covers the glitch.
+func inspectContainerImage(ssh *remote.Client, bin, container string) (string, error) {
+	cmd := fmt.Sprintf("%s inspect --format '{{.Config.Image}}' %s",
+		shQuote(bin), shQuote(container))
+	var last error
+	for attempt := 1; attempt <= 3; attempt++ {
+		out, err := ssh.Run(cmd)
+		if err != nil {
+			last = fmt.Errorf("docker inspect (attempt %d): %w (%q)", attempt, err, string(out))
+			continue
+		}
+		image := strings.TrimSpace(string(out))
+		if image != "" && isPrintableASCII(image) {
+			return image, nil
+		}
+		preview := []byte(image)
+		if len(preview) > 32 {
+			preview = preview[:32]
+		}
+		last = fmt.Errorf("docker inspect returned non-printable output on attempt %d (%d bytes, hex=%x)",
+			attempt, len(image), preview)
+	}
+	return "", fmt.Errorf("resolve container image for %q: %w — try restarting sshd / docker on the target, or set target.docker.image manually",
+		container, last)
+}
+
+// isPrintableASCII reports whether every byte of s is in 0x20..0x7e.
+// Used to sanity-check SSH-captured output that is meant to be a
+// repo:tag style string.
+func isPrintableASCII(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, b := range []byte(s) {
+		if b < 0x20 || b > 0x7e {
+			return false
+		}
+	}
+	return true
 }
 
 func runCmd(cmd *exec.Cmd, log *slog.Logger, prefix string) error {
