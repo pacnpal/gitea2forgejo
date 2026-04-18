@@ -176,6 +176,12 @@ func stageFilesRemote(cfg *config.Config, log *slog.Logger) error {
 // stageFilesLocal is the loopback optimization: extract the tarball
 // onto the target's OWN filesystem, then rename the subdirs into their
 // final homes. No cross-fs copy except the tar decompression itself.
+//
+// Staging dir selection mirrors dump's Docker-aware logic: when the
+// target is containerized, use the HOST side of a target.docker.mounts
+// entry so the staging dir is guaranteed to live on the same filesystem
+// as — and be visible from — the container. Otherwise, use the parent
+// of data_dir.
 func stageFilesLocal(cfg *config.Config, log *slog.Logger) error {
 	ext := cfg.Options.DumpFormat
 	tarPath := filepath.Join(cfg.WorkDir, "gitea-dump."+ext)
@@ -183,11 +189,7 @@ func stageFilesLocal(cfg *config.Config, log *slog.Logger) error {
 		return fmt.Errorf("dump tarball not found: %w", err)
 	}
 
-	// Staging dir on the target's filesystem (sibling of data_dir). This
-	// placement means os.Rename below lands in O(1) when the target
-	// subdirs are on the same fs — which they always are within a
-	// single appdata tree.
-	stage := filepath.Join(filepath.Dir(cfg.Target.DataDir), ".gitea2forgejo-stage")
+	stage := pickStagingDir(cfg)
 	if err := os.RemoveAll(stage); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("clean stale staging %s: %w", stage, err)
 	}
@@ -262,6 +264,37 @@ func moveIntoPlace(cfg *config.Config, src, dst string, log *slog.Logger) error 
 	return RsyncToTarget(cfg, src, dst, log)
 }
 
+// pickStagingDir selects a HOST path to extract into such that subsequent
+// os.Rename calls into the target directories land on the same filesystem.
+//
+// Preference order:
+//   1. A subdir under the TARGET's docker bind mount host path (same
+//      logic as dump's pickDockerScratch — guarantees intra-fs + visible
+//      from the container if we need to chown through docker exec).
+//   2. The parent of target.data_dir (bare-metal default).
+func pickStagingDir(cfg *config.Config) string {
+	const name = ".gitea2forgejo-stage"
+	if cfg.Target.Docker != nil && len(cfg.Target.Docker.Mounts) > 0 {
+		// Prefer a mount that covers data_dir (that's where we'll move
+		// most bytes); fall back to the first mount.
+		if cfg.Target.DataDir != "" && cfg.Target.Docker.HostToContainer(cfg.Target.DataDir) != "" {
+			// Walk up data_dir until we hit a mount's host side.
+			for _, m := range cfg.Target.Docker.Mounts {
+				host := strings.TrimRight(m.Host, "/")
+				if host == "" {
+					continue
+				}
+				if cfg.Target.DataDir == host ||
+					strings.HasPrefix(cfg.Target.DataDir+"/", host+"/") {
+					return filepath.Join(host, name)
+				}
+			}
+		}
+		return filepath.Join(cfg.Target.Docker.Mounts[0].Host, name)
+	}
+	return filepath.Join(filepath.Dir(cfg.Target.DataDir), name)
+}
+
 func isEmptyDir(p string) (bool, error) {
 	f, err := os.Open(p)
 	if err != nil {
@@ -330,8 +363,20 @@ func orDefaultStr(v, d string) string {
 	return v
 }
 
-// Chown flips ownership of the target data tree to the forgejo user.
+// Chown flips ownership of the target data tree to the Forgejo user.
+//
+// Two paths:
+//   Docker: run `docker exec <container> chown -R <user>:<user> <container-path>`.
+//           The container's user namespace resolves the name correctly
+//           (gitea/forgejo images include the `git` user); host-side
+//           users like `forgejo` often don't exist on minimal distros
+//           like Unraid. Paths are translated host→container via
+//           target.docker.HostToContainer.
+//   Bare-metal: `ssh chown -R forgejo:forgejo <host-path>` as before.
 func Chown(ssh *remote.Client, cfg *config.Config, log *slog.Logger) error {
+	if cfg.Target.Docker != nil && cfg.Target.Docker.Container != "" {
+		return chownViaDocker(ssh, cfg, log)
+	}
 	user := cfg.Target.RunAs
 	if user == "" {
 		user = "forgejo"
@@ -342,10 +387,38 @@ func Chown(ssh *remote.Client, cfg *config.Config, log *slog.Logger) error {
 			continue
 		}
 		cmd := fmt.Sprintf("chown -R %s %s", spec, shQuote(dir))
-		log.Info("chown", "dir", dir, "owner", spec)
+		log.Info("chown (host)", "dir", dir, "owner", spec)
 		out, err := ssh.Run(cmd)
 		if err != nil {
 			return fmt.Errorf("chown %s: %w (%s)", dir, err, string(out))
+		}
+	}
+	return nil
+}
+
+func chownViaDocker(ssh *remote.Client, cfg *config.Config, log *slog.Logger) error {
+	d := cfg.Target.Docker
+	user := orDefaultStr(d.User, "git")
+	spec := user + ":" + user
+	for _, hostDir := range []string{cfg.Target.DataDir, cfg.Target.RepoRoot, cfg.Target.CustomDir} {
+		if hostDir == "" {
+			continue
+		}
+		containerDir := d.HostToContainer(hostDir)
+		if containerDir == "" {
+			log.Warn("chown (docker): host path not under any bind mount; skipping",
+				"host", hostDir)
+			continue
+		}
+		cmd := fmt.Sprintf("%s exec %s chown -R %s %s",
+			shQuote(orDefaultStr(d.Binary, "docker")),
+			shQuote(d.Container),
+			shQuote(spec),
+			shQuote(containerDir))
+		log.Info("chown (docker exec)", "container_dir", containerDir, "owner", spec)
+		out, err := ssh.Run(cmd)
+		if err != nil {
+			return fmt.Errorf("chown %s via docker: %w (%s)", containerDir, err, string(out))
 		}
 	}
 	return nil
