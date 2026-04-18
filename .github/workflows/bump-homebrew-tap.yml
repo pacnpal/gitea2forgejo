@@ -46,6 +46,37 @@ jobs:
           fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
+      - name: Wait for SLSA build to publish release binaries
+        env:
+          TAG: ${{ steps.ver.outputs.tag }}
+        # The `release: published` event fires as soon as the tag is
+        # created, but the SLSA Go releaser workflow takes ~2–3 min to
+        # build + upload all six platform binaries. Poll until every
+        # expected asset returns 200 — or time out after 10 minutes.
+        run: |
+          set -euo pipefail
+          required=(linux-amd64 linux-arm64 darwin-amd64 darwin-arm64)
+          for attempt in $(seq 1 20); do
+            missing=0
+            for p in "${required[@]}"; do
+              code="$(curl -fsSLI -o /dev/null -w '%{http_code}' \
+                "https://github.com/pacnpal/gitea2forgejo/releases/download/${TAG}/gitea2forgejo-${p}" \
+                || echo 000)"
+              if [ "$code" != "200" ]; then
+                missing=1
+                echo "attempt ${attempt}/20: waiting for gitea2forgejo-${p} (HTTP ${code})"
+                break
+              fi
+            done
+            if [ "$missing" = "0" ]; then
+              echo "all binaries present for ${TAG}"
+              exit 0
+            fi
+            sleep 30
+          done
+          echo "timed out waiting for release binaries after 10 minutes" >&2
+          exit 1
+
       - name: Download release binaries and compute SHA256s
         id: hashes
         env:
