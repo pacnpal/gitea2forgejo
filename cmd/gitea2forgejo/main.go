@@ -22,6 +22,7 @@ import (
 	"github.com/pacnpal/gitea2forgejo/internal/config"
 	"github.com/pacnpal/gitea2forgejo/internal/dump"
 	"github.com/pacnpal/gitea2forgejo/internal/initcmd"
+	"github.com/pacnpal/gitea2forgejo/internal/migrate"
 	"github.com/pacnpal/gitea2forgejo/internal/preflight"
 	"github.com/pacnpal/gitea2forgejo/internal/restore"
 	"github.com/pacnpal/gitea2forgejo/internal/selfupdate"
@@ -83,6 +84,8 @@ func main() {
 	root.AddCommand(newDumpCmd())
 	root.AddCommand(newVerifyDumpCmd())
 	root.AddCommand(newRestoreCmd())
+	root.AddCommand(newMigrateCmd())
+	root.AddCommand(newDumpAndRestoreCmd())
 	root.AddCommand(newCleanupCmd())
 	root.AddCommand(newUpdateCmd())
 
@@ -94,6 +97,59 @@ func main() {
 
 func loadConfig() (*config.Config, error) {
 	return config.Load(configPath)
+}
+
+func newMigrateCmd() *cobra.Command {
+	opt := migrate.Options{}
+	cmd := &cobra.Command{
+		Use:   "migrate",
+		Short: "End-to-end: preflight → dump → verify-dump → restore",
+		Long: "Runs the full Gitea → Forgejo migration in one invocation.\n\n" +
+			"Executes in order, stopping on the first hard failure:\n\n" +
+			"  1. preflight    — read-only checks (versions, SSH, DB, SECRET_KEY,\n" +
+			"                    target-db-empty, disk space)\n" +
+			"  2. dump         — gitea dump + native DB dump + source manifest\n" +
+			"  3. verify-dump  — cross-check dump artifacts against the manifest\n" +
+			"  4. restore      — import into target Forgejo + doctor + hooks\n\n" +
+			"Any stage can be skipped with --skip-<stage>. Useful when iterating:\n" +
+			"once preflight passes you usually don't need to re-run it, so a\n" +
+			"resumption flow looks like:\n\n" +
+			"  gitea2forgejo migrate --skip-preflight --skip-dump --skip-verify\n\n" +
+			"After a successful run, `gitea2forgejo cleanup` reclaims disk space.",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := loadConfig()
+			if err != nil {
+				return err
+			}
+			os.Setenv("CONFIG_PATH_HINT", configPath)
+			return migrate.Run(cfg, opt, log)
+		},
+	}
+	cmd.Flags().BoolVar(&opt.SkipPreflight, "skip-preflight", false, "don't run preflight (assume already passed)")
+	cmd.Flags().BoolVar(&opt.SkipDump, "skip-dump", false, "don't run dump (assume artifacts already exist)")
+	cmd.Flags().BoolVar(&opt.SkipVerify, "skip-verify", false, "don't run verify-dump")
+	cmd.Flags().BoolVar(&opt.SkipRestore, "skip-restore", false, "don't run restore (dry-run up to verify-dump)")
+	return cmd
+}
+
+func newDumpAndRestoreCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "dump-and-restore",
+		Short: "Shortcut: dump → verify-dump → restore (skip preflight)",
+		Long: "Runs dump, verify-dump, and restore in sequence. Use this when\n" +
+			"you've already validated the environment with a prior preflight\n" +
+			"and just want to execute the data-moving stages.\n\n" +
+			"Equivalent to:\n" +
+			"  gitea2forgejo migrate --skip-preflight",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := loadConfig()
+			if err != nil {
+				return err
+			}
+			os.Setenv("CONFIG_PATH_HINT", configPath)
+			return migrate.Run(cfg, migrate.Options{SkipPreflight: true}, log)
+		},
+	}
 }
 
 func newCleanupCmd() *cobra.Command {
@@ -121,6 +177,13 @@ metal). Prompts for confirmation unless --force.`,
 	cmd.Flags().BoolVar(&opt.KeepLocal, "keep-local", false, "only clean up the source host scratch, leave work_dir alone")
 	cmd.Flags().BoolVar(&opt.KeepRemote, "keep-remote", false, "only clean up work_dir, leave the source host scratch alone")
 	return cmd
+}
+
+// hintNext prints a consistent "Next:" line so operators know the
+// canonical successor command to their current one. Plain stderr
+// write — avoids entanglement with structured logs.
+func hintNext(cmd string) {
+	fmt.Fprintf(os.Stderr, "\nNext: %s\n", cmd)
 }
 
 func newUpdateCmd() *cobra.Command {
@@ -415,6 +478,7 @@ func newPreflightCmd() *cobra.Command {
 			if result.HardFails > 0 {
 				return fmt.Errorf("preflight: %d hard fails", result.HardFails)
 			}
+			hintNext("gitea2forgejo dump --config " + configPath)
 			return nil
 		},
 	}
@@ -440,7 +504,11 @@ Individual stages can be skipped via options.skip_* in config.`,
 				return err
 			}
 			log.Info("dump: starting", "source", cfg.Source.URL, "work_dir", cfg.WorkDir)
-			return dump.Run(cfg, log)
+			if err := dump.Run(cfg, log); err != nil {
+				return err
+			}
+			hintNext("gitea2forgejo verify-dump --config " + configPath)
+			return nil
 		},
 	}
 }
@@ -487,6 +555,7 @@ Exit non-zero when any check is FAIL so this can gate a CI pipeline.`,
 			if res.HardFails > 0 {
 				return fmt.Errorf("verify-dump: %d hard fails", res.HardFails)
 			}
+			hintNext("gitea2forgejo restore --config " + configPath)
 			return nil
 		},
 	}
@@ -519,7 +588,18 @@ The target Forgejo MUST be installed and configured with an empty DB.`,
 				return err
 			}
 			log.Info("restore: starting", "target", cfg.Target.URL, "work_dir", cfg.WorkDir)
-			return restore.Run(cfg, log)
+			if err := restore.Run(cfg, log); err != nil {
+				return err
+			}
+			fmt.Fprintln(os.Stderr)
+			fmt.Fprintln(os.Stderr, "Post-restore checklist:")
+			fmt.Fprintln(os.Stderr, "  1. Smoke-test the target Forgejo in a browser")
+			fmt.Fprintln(os.Stderr, "  2. Re-register Actions runners (tokens are hostname-scoped)")
+			fmt.Fprintln(os.Stderr, "  3. Announce to users: re-login, regenerate PATs, verify 2FA")
+			fmt.Fprintln(os.Stderr, "  4. Update DNS / reverse proxy when ready")
+			fmt.Fprintln(os.Stderr)
+			hintNext("gitea2forgejo cleanup --config " + configPath + "   # after confirming migration")
+			return nil
 		},
 	}
 }
