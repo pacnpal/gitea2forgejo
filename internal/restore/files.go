@@ -398,28 +398,64 @@ func Chown(ssh *remote.Client, cfg *config.Config, log *slog.Logger) error {
 
 func chownViaDocker(ssh *remote.Client, cfg *config.Config, log *slog.Logger) error {
 	d := cfg.Target.Docker
+	bin := orDefaultStr(d.Binary, "docker")
 	user := orDefaultStr(d.User, "git")
 	spec := user + ":" + user
+
+	// Collect container-side paths to chown. Warn (not fail) for paths
+	// that aren't under any bind mount — usually a stale container-style
+	// default in cfg.Target.CustomDir that has no host-side equivalent
+	// to touch.
+	var dirs []string
 	for _, hostDir := range []string{cfg.Target.DataDir, cfg.Target.RepoRoot, cfg.Target.CustomDir} {
 		if hostDir == "" {
 			continue
 		}
-		containerDir := d.HostToContainer(hostDir)
-		if containerDir == "" {
+		cd := d.HostToContainer(hostDir)
+		if cd == "" {
 			log.Warn("chown (docker): host path not under any bind mount; skipping",
 				"host", hostDir)
 			continue
 		}
-		cmd := fmt.Sprintf("%s exec %s chown -R %s %s",
-			shQuote(orDefaultStr(d.Binary, "docker")),
-			shQuote(d.Container),
-			shQuote(spec),
-			shQuote(containerDir))
-		log.Info("chown (docker exec)", "container_dir", containerDir, "owner", spec)
-		out, err := ssh.Run(cmd)
-		if err != nil {
-			return fmt.Errorf("chown %s via docker: %w (%s)", containerDir, err, string(out))
-		}
+		dirs = append(dirs, cd)
+	}
+	if len(dirs) == 0 {
+		return nil
+	}
+
+	// Resolve the Forgejo container's image so the throwaway chown
+	// container has the same /etc/passwd (critical: "git" must resolve
+	// to the same uid/gid Forgejo runs as). `docker exec` would be
+	// simpler but the Forgejo container is stopped for the restore
+	// window — exec requires a running container, run --volumes-from
+	// does not. The inherited volumes land at the same paths the
+	// Forgejo container sees, so the container-side paths we already
+	// computed work verbatim.
+	imgOut, err := ssh.Run(fmt.Sprintf("%s inspect --format '{{.Config.Image}}' %s",
+		shQuote(bin), shQuote(d.Container)))
+	if err != nil {
+		return fmt.Errorf("inspect container image: %w (%s)", err, string(imgOut))
+	}
+	image := strings.TrimSpace(string(imgOut))
+	if image == "" {
+		return fmt.Errorf("container %q has no recorded image", d.Container)
+	}
+
+	args := []string{
+		shQuote(bin), "run", "--rm",
+		"--volumes-from", shQuote(d.Container),
+		"--entrypoint", "chown",
+		shQuote(image),
+		"-R", shQuote(spec),
+	}
+	for _, dir := range dirs {
+		args = append(args, shQuote(dir))
+	}
+	cmd := strings.Join(args, " ")
+	log.Info("chown (docker sidecar)", "image", image, "dirs", dirs, "owner", spec)
+	out, err := ssh.Run(cmd)
+	if err != nil {
+		return fmt.Errorf("chown via sidecar: %w (%s)", err, string(out))
 	}
 	return nil
 }
