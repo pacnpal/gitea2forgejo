@@ -5,20 +5,25 @@
 package main
 
 import (
+	"bufio"
+	"context"
 	"fmt"
 	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
 
 	"github.com/spf13/cobra"
+	"golang.org/x/term"
 
 	"github.com/pacnpal/gitea2forgejo/internal/config"
 	"github.com/pacnpal/gitea2forgejo/internal/dump"
 	"github.com/pacnpal/gitea2forgejo/internal/initcmd"
 	"github.com/pacnpal/gitea2forgejo/internal/preflight"
 	"github.com/pacnpal/gitea2forgejo/internal/restore"
+	"github.com/pacnpal/gitea2forgejo/internal/selfupdate"
 	"github.com/pacnpal/gitea2forgejo/internal/verifydump"
 )
 
@@ -29,9 +34,10 @@ var (
 )
 
 var (
-	configPath string
-	logLevel   string
-	log        *slog.Logger
+	configPath     string
+	logLevel       string
+	noUpdateCheck  bool
+	log            *slog.Logger
 )
 
 func main() {
@@ -41,8 +47,7 @@ func main() {
 		Version: fmt.Sprintf("%s (commit %s)", version, commit),
 		PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
 			// Emit the version banner as the very first line of stderr
-			// for every subcommand. Helps users attach the right build
-			// to bug reports without having to re-run with --version.
+			// for every subcommand.
 			fmt.Fprintf(os.Stderr, "gitea2forgejo %s (commit %s)\n", version, commit)
 
 			lvl := slog.LevelInfo
@@ -55,17 +60,29 @@ func main() {
 				lvl = slog.LevelError
 			}
 			log = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: lvl}))
+
+			// Auto-check for updates. Rate-limited to once per 6 hours
+			// via a timestamp file in ~/.cache/gitea2forgejo, so this
+			// doesn't hit GitHub every command. Skip when:
+			//   - --no-update-check was passed
+			//   - running the `update` subcommand (avoid recursion)
+			//   - stdin isn't a TTY (CI / scripted runs)
+			if !noUpdateCheck && cmd.Name() != "update" && cmd.Name() != "completion" {
+				maybePromptUpdate(cmd.Context(), cmd.Name(), args)
+			}
 			return nil
 		},
 	}
 	root.PersistentFlags().StringVar(&configPath, "config", "config.yaml", "path to config YAML")
 	root.PersistentFlags().StringVar(&logLevel, "log-level", "info", "debug|info|warn|error")
+	root.PersistentFlags().BoolVar(&noUpdateCheck, "no-update-check", false, "disable the once-per-6h auto-check for a newer release")
 
 	root.AddCommand(newInitCmd())
 	root.AddCommand(newPreflightCmd())
 	root.AddCommand(newDumpCmd())
 	root.AddCommand(newVerifyDumpCmd())
 	root.AddCommand(newRestoreCmd())
+	root.AddCommand(newUpdateCmd())
 
 	if err := root.Execute(); err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
@@ -75,6 +92,116 @@ func main() {
 
 func loadConfig() (*config.Config, error) {
 	return config.Load(configPath)
+}
+
+func newUpdateCmd() *cobra.Command {
+	var force bool
+	cmd := &cobra.Command{
+		Use:   "update",
+		Short: "Self-update to the latest release on GitHub",
+		Long: `Queries https://api.github.com/repos/` + selfupdate.Repo + `/releases/latest,
+compares to the running build, downloads the matching binary for the
+current OS/arch, and atomically replaces the running executable.
+
+Requires write access to the installed location (e.g. /usr/local/bin).
+If permission is denied, re-run with sudo.`,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			release, err := selfupdate.Latest(cmd.Context())
+			if err != nil {
+				return fmt.Errorf("query latest release: %w", err)
+			}
+			newer, err := selfupdate.IsNewer(version, release.TagName)
+			if err != nil {
+				return err
+			}
+			if !newer && !force {
+				fmt.Fprintf(os.Stderr, "already up to date (running %s, latest %s)\n", version, release.TagName)
+				return nil
+			}
+			fmt.Fprintf(os.Stderr, "updating %s → %s\n", version, release.TagName)
+			if err := selfupdate.Apply(cmd.Context(), release.TagName,
+				func(f string, a ...any) { fmt.Fprintf(os.Stderr, f+"\n", a...) }); err != nil {
+				return fmt.Errorf("apply: %w", err)
+			}
+			selfupdate.RecordCheck()
+			fmt.Fprintf(os.Stderr, "updated. new version: ")
+			return runSelfOnce("--version")
+		},
+	}
+	cmd.Flags().BoolVar(&force, "force", false, "download + install even if already at the latest version")
+	return cmd
+}
+
+// runSelfOnce execs the just-installed binary with one arg so the operator
+// sees the new version string in the same output stream.
+func runSelfOnce(arg string) error {
+	self, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	c := exec.Command(self, arg)
+	c.Stdout = os.Stderr
+	c.Stderr = os.Stderr
+	return c.Run()
+}
+
+// maybePromptUpdate performs the once-per-CheckTTL auto-check. If a
+// newer release is available AND stdin is a TTY, prompt the operator to
+// upgrade inline (downloads + replaces + re-execs the original command).
+// Any failure is logged and ignored — update checks must never block a
+// legitimate command.
+func maybePromptUpdate(ctx context.Context, cmdName string, cmdArgs []string) {
+	if !selfupdate.ShouldCheck() {
+		return
+	}
+	if !term.IsTerminal(int(os.Stdin.Fd())) {
+		return
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	release, err := selfupdate.Latest(ctx)
+	selfupdate.RecordCheck() // record even on failure; don't retry for 6h
+	if err != nil {
+		return
+	}
+	newer, err := selfupdate.IsNewer(version, release.TagName)
+	if err != nil || !newer {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "\n━━ a newer gitea2forgejo is available ━━\n"+
+		"   running:  %s\n"+
+		"   latest:   %s (%s)\n"+
+		"Update now? [Y/n]: ", version, release.TagName, release.HTMLURL)
+	r := bufio.NewReader(os.Stdin)
+	line, err := r.ReadString('\n')
+	if err != nil {
+		fmt.Fprintln(os.Stderr)
+		return
+	}
+	ans := strings.ToLower(strings.TrimSpace(line))
+	if ans == "n" || ans == "no" {
+		fmt.Fprintln(os.Stderr, "  skipping update")
+		return
+	}
+	if err := selfupdate.Apply(ctx, release.TagName,
+		func(f string, a ...any) { fmt.Fprintf(os.Stderr, f+"\n", a...) }); err != nil {
+		fmt.Fprintf(os.Stderr, "  update failed: %v\n  continuing with old version\n", err)
+		return
+	}
+	fmt.Fprintf(os.Stderr, "  updated to %s — re-executing your command\n", release.TagName)
+	// syscall.Exec replaces this process with the new binary, preserving
+	// the current CLI args. Works on Linux + macOS (the Apply() function
+	// already refuses on Windows).
+	self, err := os.Executable()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "  can't locate updated binary: %v\n  please re-run your command\n", err)
+		os.Exit(0)
+	}
+	if err := syscallExec(self, os.Args, os.Environ()); err != nil {
+		fmt.Fprintf(os.Stderr, "  re-exec failed: %v\n  please re-run your command\n", err)
+		os.Exit(0)
+	}
 }
 
 func newInitCmd() *cobra.Command {
