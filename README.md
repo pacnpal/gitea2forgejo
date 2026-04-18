@@ -49,6 +49,25 @@ this tool handles and what requires manual operator action.
 
 ## Install
 
+### Homebrew (macOS + Linux)
+
+```sh
+brew tap pacnpal/gitea2forgejo
+brew install gitea2forgejo
+```
+
+Pulls in the required external tools (`rsync`, `libpq` for `pg_dump`,
+`mysql-client`, `sqlite`, `zstd`) as formula dependencies automatically.
+
+Update:
+
+```sh
+brew update && brew upgrade gitea2forgejo
+```
+
+Tap repo: https://github.com/pacnpal/homebrew-gitea2forgejo — formula is
+auto-bumped by GitHub Actions on every release.
+
 ### One-line installer (recommended)
 
 **Linux / macOS:**
