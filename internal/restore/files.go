@@ -396,14 +396,22 @@ func ChownInContainer(ssh *remote.Client, cfg *config.Config, log *slog.Logger) 
 		return nil
 	}
 
-	// sh -c … so the exec runs chown against each dir with && short-
-	// circuit, stopping on the first failure with a clear error. -u 0
-	// forces root inside the container regardless of the image's USER.
-	var paths []string
+	// sh -c loop chowns each dir independently, skipping ones that
+	// don't exist inside the container. A host path can translate
+	// cleanly to a container path that isn't where Forgejo keeps that
+	// data — for example target.custom_dir translates to /data/custom
+	// but Forgejo's actual custom dir is /data/gitea/custom. The
+	// pre-start sidecar chowns host-side via test -d; this runs inside
+	// the container where we can only check container-side paths, so
+	// the same filter logic lives inside the shell. -u 0 forces root
+	// regardless of the image's USER directive.
+	var quoted []string
 	for _, d := range dirs {
-		paths = append(paths, shQuote(d))
+		quoted = append(quoted, shQuote(d))
 	}
-	inner := fmt.Sprintf("chown -R %s %s", shQuote(spec), strings.Join(paths, " "))
+	inner := fmt.Sprintf(
+		`for d in %s; do if [ -e "$d" ]; then chown -R %s "$d" || exit 1; fi; done`,
+		strings.Join(quoted, " "), shQuote(spec))
 	cmd := fmt.Sprintf("%s exec -u 0 %s sh -c %s",
 		shQuote(bin), shQuote(d.Container), shQuote(inner))
 	log.Info("chown (docker exec post-start)", "dirs", dirs, "owner", spec)
