@@ -19,6 +19,14 @@
 
 set -euo pipefail
 
+# Everything below runs inside _main(). When invoked via `curl | bash`,
+# bash reads function bodies eagerly (looking for the closing `}`),
+# so the whole script is parsed into memory BEFORE any subprocess
+# starts. Without this wrapper, package-manager child scripts (Homebrew's
+# postgres post-install, apt hooks, etc.) can consume remaining stdin
+# bytes that were still on their way from curl — truncating mid-install.
+_main() {
+
 REPO="pacnpal/gitea2forgejo"
 INSTALL_DIR="${INSTALL_DIR:-/usr/local/bin}"
 VERSION="${VERSION:-}"
@@ -224,3 +232,9 @@ else
   printf "Add it to \$PATH or call the binary directly:\n"
   printf "  ${C_BLU}${DEST} --version${C_OFF}\n"
 fi
+
+} # end _main
+
+# Belt-and-braces: redirect stdin away from this shell so any helper
+# subprocess that accidentally reads it can't steal our bytes.
+_main "$@" < /dev/null
