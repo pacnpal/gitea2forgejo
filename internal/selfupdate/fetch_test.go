@@ -11,7 +11,7 @@ import (
 	"time"
 )
 
-func TestFetchRelease_retriesOn5xx(t *testing.T) {
+func TestFetchJSON_retriesOn5xx(t *testing.T) {
 	var hits int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		n := atomic.AddInt32(&hits, 1)
@@ -26,8 +26,8 @@ func TestFetchRelease_retriesOn5xx(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	r, err := fetchRelease(context.Background(), srv.URL)
-	if err != nil {
+	var r Release
+	if err := fetchJSON(context.Background(), srv.URL, &r); err != nil {
 		t.Fatalf("unexpected err: %v", err)
 	}
 	if got := atomic.LoadInt32(&hits); got != 2 {
@@ -38,7 +38,7 @@ func TestFetchRelease_retriesOn5xx(t *testing.T) {
 	}
 }
 
-func TestFetchRelease_no404Retry(t *testing.T) {
+func TestFetchJSON_no404Retry(t *testing.T) {
 	var hits int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt32(&hits, 1)
@@ -46,7 +46,8 @@ func TestFetchRelease_no404Retry(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	_, err := fetchRelease(context.Background(), srv.URL)
+	var r Release
+	err := fetchJSON(context.Background(), srv.URL, &r)
 	if err == nil {
 		t.Fatal("expected error")
 	}
@@ -58,7 +59,7 @@ func TestFetchRelease_no404Retry(t *testing.T) {
 	}
 }
 
-func TestFetchRelease_retriesExhausted(t *testing.T) {
+func TestFetchJSON_retriesExhausted(t *testing.T) {
 	var hits int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt32(&hits, 1)
@@ -68,7 +69,8 @@ func TestFetchRelease_retriesExhausted(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	_, err := fetchRelease(ctx, srv.URL)
+	var r Release
+	err := fetchJSON(ctx, srv.URL, &r)
 	if err == nil {
 		t.Fatal("expected error after retries exhausted")
 	}

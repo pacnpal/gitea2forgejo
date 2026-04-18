@@ -206,18 +206,26 @@ errors. If GitHub's /releases/latest still appears stuck, use --to
 Requires write access to the installed location (e.g. /usr/local/bin).
 If permission is denied, re-run with sudo.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			asset := selfupdate.CurrentAssetName()
 			var release *selfupdate.Release
-			var err error
 			if toTag != "" {
-				release, err = selfupdate.ByTag(cmd.Context(), toTag)
+				r, err := selfupdate.ByTag(cmd.Context(), toTag)
 				if err != nil {
 					return fmt.Errorf("query release %q: %w", toTag, err)
 				}
-			} else {
-				release, err = selfupdate.Latest(cmd.Context())
-				if err != nil {
-					return fmt.Errorf("query latest release: %w", err)
+				if !r.HasAsset(asset) {
+					return fmt.Errorf("release %s has no asset %q for this platform — check the Actions run or pick a different tag", r.TagName, asset)
 				}
+				release = r
+			} else {
+				r, skipped, err := selfupdate.LatestWithAsset(cmd.Context(), asset)
+				if err != nil {
+					return fmt.Errorf("query latest release with asset %q: %w", asset, err)
+				}
+				for _, tag := range skipped {
+					fmt.Fprintf(os.Stderr, "  skipping %s — no %s asset (likely a partial/in-flight SLSA build)\n", tag, asset)
+				}
+				release = r
 			}
 			newer, err := selfupdate.IsNewer(version, release.TagName)
 			if err != nil {
@@ -226,7 +234,7 @@ If permission is denied, re-run with sudo.`,
 			// --to is an explicit operator choice; allow downgrade /
 			// reinstall without requiring --force.
 			if !newer && !force && toTag == "" {
-				fmt.Fprintf(os.Stderr, "already up to date (running %s, latest %s)\n", version, release.TagName)
+				fmt.Fprintf(os.Stderr, "already up to date (running %s, latest-with-asset %s)\n", version, release.TagName)
 				return nil
 			}
 			fmt.Fprintf(os.Stderr, "updating %s → %s\n", version, release.TagName)
@@ -272,7 +280,7 @@ func maybePromptUpdate(ctx context.Context, cmdName string, cmdArgs []string) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	release, err := selfupdate.Latest(ctx)
+	release, _, err := selfupdate.LatestWithAsset(ctx, selfupdate.CurrentAssetName())
 	selfupdate.RecordCheck() // record even on failure; don't retry for 6h
 	if err != nil {
 		return

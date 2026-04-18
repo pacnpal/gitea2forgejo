@@ -30,85 +30,155 @@ const (
 	latestAPI  = "https://api.github.com/repos/" + Repo + "/releases/latest"
 	userAgent  = "gitea2forgejo-self-update"
 	httpClient = 6 * time.Second
+	// listLimit caps how many historical releases LatestWithAsset walks
+	// before giving up. Well above any plausible backlog of partial SLSA
+	// uploads — if the current platform hasn't had a binary in 30
+	// releases, the operator has a bigger problem than self-update.
+	listLimit = 30
 )
 
 // Release is the subset of the GitHub Releases API response we use.
 type Release struct {
-	TagName     string `json:"tag_name"`
-	Name        string `json:"name"`
-	HTMLURL     string `json:"html_url"`
-	PublishedAt string `json:"published_at"`
+	TagName     string  `json:"tag_name"`
+	Name        string  `json:"name"`
+	HTMLURL     string  `json:"html_url"`
+	PublishedAt string  `json:"published_at"`
+	Draft       bool    `json:"draft"`
+	Prerelease  bool    `json:"prerelease"`
+	Assets      []Asset `json:"assets"`
 }
 
-// Latest returns the latest release (not prerelease). 6-second timeout so
-// network hiccups don't block the tool's regular commands. One automatic
-// retry on transient errors (5xx / network) — GitHub occasionally 502s
-// during heavy release traffic. Sends Cache-Control: no-cache so CDN
-// edges revalidate instead of serving a stale "latest" right after a
-// new release publishes.
+// Asset is a single uploaded file attached to a GitHub release.
+type Asset struct {
+	Name               string `json:"name"`
+	BrowserDownloadURL string `json:"browser_download_url"`
+}
+
+// HasAsset reports whether the release carries an asset with exactly
+// the given name.
+func (r *Release) HasAsset(name string) bool {
+	for _, a := range r.Assets {
+		if a.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+// CurrentAssetName returns the binary filename uploaded by the SLSA
+// matrix build for this process's GOOS / GOARCH. Windows adds .exe.
+func CurrentAssetName() string {
+	name := fmt.Sprintf("gitea2forgejo-%s-%s", runtime.GOOS, runtime.GOARCH)
+	if runtime.GOOS == "windows" {
+		name += ".exe"
+	}
+	return name
+}
+
+// Latest returns /releases/latest as-is (may be missing the current
+// platform's asset — prefer LatestWithAsset for the update path).
+// Kept for callers that want GitHub's notion of "latest" verbatim.
+// 6-second timeout, one retry on 5xx/network, Cache-Control: no-cache.
 func Latest(ctx context.Context) (*Release, error) {
-	return fetchRelease(ctx, latestAPI)
+	var r Release
+	if err := fetchJSON(ctx, latestAPI, &r); err != nil {
+		return nil, err
+	}
+	return &r, nil
 }
 
-// ByTag returns the release with the given tag (e.g. "v0.2.15"). Used by
-// `update --to <tag>` to bypass /releases/latest entirely when the
-// operator knows exactly which version they want.
+// ByTag returns the release with the given tag (e.g. "v0.2.15"). Used
+// by `update --to <tag>` to bypass /releases/latest when the operator
+// knows exactly which version they want.
 func ByTag(ctx context.Context, tag string) (*Release, error) {
 	url := fmt.Sprintf("https://api.github.com/repos/%s/releases/tags/%s", Repo, tag)
-	return fetchRelease(ctx, url)
+	var r Release
+	if err := fetchJSON(ctx, url, &r); err != nil {
+		return nil, err
+	}
+	return &r, nil
 }
 
-func fetchRelease(ctx context.Context, url string) (*Release, error) {
+// LatestWithAsset walks /releases newest-first and returns the first
+// non-draft, non-prerelease that actually has an asset matching
+// assetName. Also returns the tags that were skipped along the way so
+// the caller can surface them ("skipped v0.2.18 — missing asset for
+// your platform").
+//
+// Handles the case where a release exists but the SLSA matrix build
+// only finished uploading some architectures: the partial release
+// stays visible to `/releases/latest`, so Apply would fail with HTTP
+// 404 on the missing binary. Falling back to the previous good
+// release keeps update monotonic and automatic.
+func LatestWithAsset(ctx context.Context, assetName string) (release *Release, skipped []string, err error) {
+	url := fmt.Sprintf("https://api.github.com/repos/%s/releases?per_page=%d", Repo, listLimit)
+	var list []Release
+	if err := fetchJSON(ctx, url, &list); err != nil {
+		return nil, nil, err
+	}
+	for i := range list {
+		r := &list[i]
+		if r.Draft || r.Prerelease {
+			continue
+		}
+		if r.HasAsset(assetName) {
+			return r, skipped, nil
+		}
+		skipped = append(skipped, r.TagName)
+	}
+	return nil, skipped, fmt.Errorf("none of the %d most recent releases carry asset %q — check the workflow runs at https://github.com/%s/actions", len(list), assetName, Repo)
+}
+
+func fetchJSON(ctx context.Context, url string, out any) error {
 	var last error
 	for attempt := 0; attempt < 2; attempt++ {
 		if attempt > 0 {
 			select {
 			case <-time.After(2 * time.Second):
 			case <-ctx.Done():
-				return nil, ctx.Err()
+				return ctx.Err()
 			}
 		}
-		r, retryable, err := fetchReleaseOnce(ctx, url)
+		retryable, err := fetchJSONOnce(ctx, url, out)
 		if err == nil {
-			return r, nil
+			return nil
 		}
 		last = err
 		if !retryable {
-			return nil, err
+			return err
 		}
 	}
-	return nil, last
+	return last
 }
 
-func fetchReleaseOnce(ctx context.Context, url string) (*Release, bool, error) {
+func fetchJSONOnce(ctx context.Context, url string, out any) (retryable bool, err error) {
 	ctx, cancel := context.WithTimeout(ctx, httpClient)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return nil, false, err
+		return false, err
 	}
 	req.Header.Set("Accept", "application/vnd.github+json")
 	req.Header.Set("User-Agent", userAgent)
 	req.Header.Set("Cache-Control", "no-cache")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return nil, true, err // network failure — retry
+		return true, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode == http.StatusNotFound {
-		return nil, false, fmt.Errorf("github api %s: release not found (HTTP 404)", url)
+		return false, fmt.Errorf("github api %s: not found (HTTP 404)", url)
 	}
 	if resp.StatusCode >= 500 {
-		return nil, true, fmt.Errorf("github api %s: HTTP %d", url, resp.StatusCode)
+		return true, fmt.Errorf("github api %s: HTTP %d", url, resp.StatusCode)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, false, fmt.Errorf("github api %s: HTTP %d", url, resp.StatusCode)
+		return false, fmt.Errorf("github api %s: HTTP %d", url, resp.StatusCode)
 	}
-	var r Release
-	if err := json.NewDecoder(resp.Body).Decode(&r); err != nil {
-		return nil, false, err
+	if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
+		return false, err
 	}
-	return &r, false, nil
+	return false, nil
 }
 
 // IsNewer reports whether `latest` is a strictly newer version than
@@ -152,7 +222,7 @@ func Apply(ctx context.Context, tag string, log func(format string, a ...any)) e
 		return fmt.Errorf("self-update not implemented for Windows — download the new release manually from https://github.com/%s/releases/latest", Repo)
 	}
 
-	assetName := fmt.Sprintf("gitea2forgejo-%s-%s", runtime.GOOS, runtime.GOARCH)
+	assetName := CurrentAssetName()
 	url := fmt.Sprintf("https://github.com/%s/releases/download/%s/%s", Repo, tag, assetName)
 
 	log("  downloading %s", url)
