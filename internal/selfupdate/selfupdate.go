@@ -41,29 +41,74 @@ type Release struct {
 }
 
 // Latest returns the latest release (not prerelease). 6-second timeout so
-// network hiccups don't block the tool's regular commands.
+// network hiccups don't block the tool's regular commands. One automatic
+// retry on transient errors (5xx / network) — GitHub occasionally 502s
+// during heavy release traffic. Sends Cache-Control: no-cache so CDN
+// edges revalidate instead of serving a stale "latest" right after a
+// new release publishes.
 func Latest(ctx context.Context) (*Release, error) {
+	return fetchRelease(ctx, latestAPI)
+}
+
+// ByTag returns the release with the given tag (e.g. "v0.2.15"). Used by
+// `update --to <tag>` to bypass /releases/latest entirely when the
+// operator knows exactly which version they want.
+func ByTag(ctx context.Context, tag string) (*Release, error) {
+	url := fmt.Sprintf("https://api.github.com/repos/%s/releases/tags/%s", Repo, tag)
+	return fetchRelease(ctx, url)
+}
+
+func fetchRelease(ctx context.Context, url string) (*Release, error) {
+	var last error
+	for attempt := 0; attempt < 2; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-time.After(2 * time.Second):
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
+		r, retryable, err := fetchReleaseOnce(ctx, url)
+		if err == nil {
+			return r, nil
+		}
+		last = err
+		if !retryable {
+			return nil, err
+		}
+	}
+	return nil, last
+}
+
+func fetchReleaseOnce(ctx context.Context, url string) (*Release, bool, error) {
 	ctx, cancel := context.WithTimeout(ctx, httpClient)
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, latestAPI, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	req.Header.Set("Accept", "application/vnd.github+json")
 	req.Header.Set("User-Agent", userAgent)
+	req.Header.Set("Cache-Control", "no-cache")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, true, err // network failure — retry
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, false, fmt.Errorf("github api %s: release not found (HTTP 404)", url)
+	}
+	if resp.StatusCode >= 500 {
+		return nil, true, fmt.Errorf("github api %s: HTTP %d", url, resp.StatusCode)
+	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("github api %s: HTTP %d", latestAPI, resp.StatusCode)
+		return nil, false, fmt.Errorf("github api %s: HTTP %d", url, resp.StatusCode)
 	}
 	var r Release
 	if err := json.NewDecoder(resp.Body).Decode(&r); err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	return &r, nil
+	return &r, false, nil
 }
 
 // IsNewer reports whether `latest` is a strictly newer version than

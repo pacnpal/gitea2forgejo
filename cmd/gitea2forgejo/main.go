@@ -188,6 +188,7 @@ func hintNext(cmd string) {
 
 func newUpdateCmd() *cobra.Command {
 	var force bool
+	var toTag string
 	cmd := &cobra.Command{
 		Use:   "update",
 		Short: "Self-update to the latest release on GitHub",
@@ -195,18 +196,36 @@ func newUpdateCmd() *cobra.Command {
 compares to the running build, downloads the matching binary for the
 current OS/arch, and atomically replaces the running executable.
 
+Sends Cache-Control: no-cache so CDN edges don't serve a stale "latest"
+right after a new release publishes, and retries once on 5xx / network
+errors. If GitHub's /releases/latest still appears stuck, use --to
+<tag> to pin a specific release directly (bypasses /releases/latest):
+
+    gitea2forgejo update --to v0.2.15
+
 Requires write access to the installed location (e.g. /usr/local/bin).
 If permission is denied, re-run with sudo.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			release, err := selfupdate.Latest(cmd.Context())
-			if err != nil {
-				return fmt.Errorf("query latest release: %w", err)
+			var release *selfupdate.Release
+			var err error
+			if toTag != "" {
+				release, err = selfupdate.ByTag(cmd.Context(), toTag)
+				if err != nil {
+					return fmt.Errorf("query release %q: %w", toTag, err)
+				}
+			} else {
+				release, err = selfupdate.Latest(cmd.Context())
+				if err != nil {
+					return fmt.Errorf("query latest release: %w", err)
+				}
 			}
 			newer, err := selfupdate.IsNewer(version, release.TagName)
 			if err != nil {
 				return err
 			}
-			if !newer && !force {
+			// --to is an explicit operator choice; allow downgrade /
+			// reinstall without requiring --force.
+			if !newer && !force && toTag == "" {
 				fmt.Fprintf(os.Stderr, "already up to date (running %s, latest %s)\n", version, release.TagName)
 				return nil
 			}
@@ -221,6 +240,7 @@ If permission is denied, re-run with sudo.`,
 		},
 	}
 	cmd.Flags().BoolVar(&force, "force", false, "download + install even if already at the latest version")
+	cmd.Flags().StringVar(&toTag, "to", "", "update to a specific release tag (e.g. v0.2.15) instead of latest; allows downgrade")
 	return cmd
 }
 
