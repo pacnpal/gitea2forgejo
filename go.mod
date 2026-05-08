@@ -3,8 +3,9 @@ module github.com/pacnpal/gitea2forgejo
 go 1.26
 
 require (
-	code.gitea.io/sdk/gitea v0.24.1
+	code.gitea.io/sdk/gitea v0.25.0
 	github.com/go-sql-driver/mysql v1.9.3
+	github.com/hashicorp/go-version v1.9.0
 	github.com/lib/pq v1.12.3
 	github.com/pkg/sftp v1.13.10
 	github.com/spf13/cobra v1.10.2
@@ -23,7 +24,6 @@ require (
 	github.com/dustin/go-humanize v1.0.1 // indirect
 	github.com/go-fed/httpsig v1.1.0 // indirect
 	github.com/google/uuid v1.6.0 // indirect
-	github.com/hashicorp/go-version v1.8.0 // indirect
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
 	github.com/kr/fs v0.1.0 // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect
